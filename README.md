@@ -9,6 +9,41 @@ Three modes depending on where you are in the pipeline:
 
 ---
 
+## Design Decisions
+
+### Embedding strategy: `[CLS || avg_patches]` vs mean pooling
+
+Two different pooling strategies are used intentionally across the pipelines.
+
+**Pre-annotation** uses `[CLS || avg_patches]` → **1536d** vectors:
+- Concatenates the CLS token (global scene summary) with the mean of all patch tokens (spatial detail)
+- The two halves capture different things — CLS = "what is this scene overall", patches = "where are the distinctive regions"
+- Full frames contain background, lighting, and context noise. Separating CLS from patch signals gives HDBSCAN more structure to work with across diverse scenes
+- Benchmarked: 1536d `[CLS||avg_patches]` outperforms 768d SigLIP `pooler_output` on scene-level separation
+
+**Pre/post-training** uses `mean(last_hidden_state)` → **768d** vectors:
+- Averages all 257 tokens (CLS + 256 patches) into one vector
+- Works well for crops because the crop IS the object — no background noise to suppress, no need to separate "scene identity" from "spatial detail"
+- Simpler, half the memory, fast enough at crop scale
+
+If you want to upgrade the crop pipeline to 1536d for consistency, change `outputs.last_hidden_state.mean(dim=1)` to explicit `CLS || patch_mean` in `postannotation_scripts/2. save_dinov2_embeddings_per_class.py`. Not done by default because 768d clustering is already effective on tight crops and the extra dims add noise without clear gain.
+
+### Dimensionality reduction: PaCMAP (pre-annotation) vs UMAP (pre-training)
+
+**Pre-annotation** uses PaCMAP:
+- Preserves global structure better than UMAP — distant clusters stay distant, not collapsed into one blob
+- Critical for frame diversity analysis: you need to see if "outdoor morning" and "indoor evening" are genuinely separate regions, not artificially pulled together
+- PaCMAP's loss balances near-pair attraction, mid-pair repulsion, and far-pair weak attraction — avoids UMAP's tendency to over-compress global distances
+
+**Pre-training** uses UMAP:
+- Better for local cluster separation within a single object class — tighter intra-cluster cohesion
+- Crops of the same class already share global structure (same object type); what matters is local sub-group boundaries
+- UMAP's parametric flexibility (`min_dist`, `n_neighbors`) is more tunable per-class via `--umap_min_dist`
+
+Short version: PaCMAP for "are my scenes diverse?" (global), UMAP for "do my crops split into sub-groups?" (local).
+
+---
+
 ## Quick Start
 
 Always run from project root. The launcher shows a menu: option 1 = pre-annotation, option 2 = pre-training. Post-training isn't in the menu — run it directly.

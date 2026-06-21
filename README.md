@@ -28,6 +28,22 @@ Two different pooling strategies are used intentionally across the pipelines.
 
 If you want to upgrade the crop pipeline to 1536d for consistency, change `outputs.last_hidden_state.mean(dim=1)` to explicit `CLS || patch_mean` in `postannotation_scripts/2. save_dinov2_embeddings_per_class.py`. Not done by default because 768d clustering is already effective on tight crops and the extra dims add noise without clear gain.
 
+### Why DINOv2 `[CLS||avg_patches]` for pre-annotation (and not SigLIP or mean pooling)
+
+This went through a few iterations.
+
+**First attempt — DINOv2 mean pooling** (same as pre/post-training crops): didn't work for full frames. Averaging all 257 tokens into one vector is fine when the image is a tight crop of one object — there's not much else there. For full scene frames it erases the spatial variation that separates one activity from another; everything averages out.
+
+**Second attempt — SigLIP**: measurably better. SigLIP's scene-level understanding pulled the clusters apart more cleanly. But it had a cluster purity problem — frames that clearly didn't belong kept appearing inside clusters. The model groups scenes by semantic category ("indoors", "outdoors") but isn't sensitive enough to texture and spatial layout to keep outlier frames out.
+
+**What worked — DINOv2 with `[CLS||avg_patches]`**: back to DINOv2, different pooling. Concatenating the CLS token (global scene identity) with the mean of all patch tokens (spatial detail) gave tighter clusters with better purity. DINOv2's patch tokens are more discriminative at the fine-grained level — trained to be useful on their own, not just supporting a global label.
+
+The `+0.253` silhouette improvement is vs SigLIP's pooled output. The purity improvement is harder to quantify but visible in the output montages.
+
+For implementation details and how the comparison was run: `utils/test_embed_models.py`.
+
+---
+
 ### Dimensionality reduction: PaCMAP (pre-annotation) vs UMAP (pre-training)
 
 **Pre-annotation** uses PaCMAP:

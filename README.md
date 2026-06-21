@@ -40,7 +40,7 @@ This went through a few iterations.
 
 The `+0.253` silhouette improvement is vs SigLIP's pooled output. The purity improvement is harder to quantify but visible in the output montages.
 
-For implementation details and how benchmarking was performed: `utils/test_embed_models.py`. Extended writeup with the full ablation narrative: [docs/embedding-ablation.md](docs/embedding-ablation.md).
+For implementation details and how benchmarking was performed: [utils/test_embed_models.py](utils/test_embed_models.py). Extended writeup with the full ablation narrative: [docs/embedding-ablation.md](docs/embedding-ablation.md).
 
 ---
 

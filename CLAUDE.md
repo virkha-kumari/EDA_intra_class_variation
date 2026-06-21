@@ -293,10 +293,10 @@ Always prompted with derived default shown — user can accept or override.
 - Imports at top of file.
 
 ### Docs & Changelog
-- **"Update docs"** = go through ALL THREE: `README.md`, `CLAUDE.md`, `change_log/changes.md` + `change_log/plans.md`. Not one.
+- **"Update docs"** = go through ALL THREE: `README.md`, `CLAUDE.md`, `docs/changes.md` + `docs/plans.md`. Not one.
 - Every code change: update README section for that script + CLAUDE.md Known Quirks if behavior changed.
-- When user says "ready to commit": update `change_log/changes.md` (add bullet), remove completed items from `change_log/plans.md`. Never leave ✅ DONE items in plans.md.
-- Only update `README.md` and `CLAUDE.md` — never create new `.md` files.
+- When user says "ready to commit": update `docs/changes.md` (add bullet), remove completed items from `docs/plans.md`. Never leave ✅ DONE items in plans.md.
+- Only update `README.md` and `CLAUDE.md` for code/behavior changes. New `.md` files only in `docs/` for standalone writeups (design decisions, ablations) — must be linked from README.
 
 ### Consistency
 - Script names exact: e.g. `postannotation_scripts/1. ann_txt_files_crop_bbox.py`
@@ -305,7 +305,7 @@ Always prompted with derived default shown — user can accept or override.
 
 ### Prohibited
 - Complex logging frameworks, database persistence, web dashboards, async processing (unless asked)
-- New documentation files — integrate into existing README.md / CLAUDE.md only
+- New documentation files outside `docs/` — integrate into existing README.md / CLAUDE.md only
 - **Never delete output/results dirs** — only intermediate dirs (e.g. `cropped_bbox_dir`). Output dirs (`cluster_dir`, `preann_results/`) are the deliverable.
 
 ## File Paths
@@ -314,3 +314,4 @@ Always prompted with derived default shown — user can accept or override.
 - Core scripts (1, 2, 3) for Post-annotation: `<project_root>/postannotation_scripts/`
 - Utility modules: `<project_root>/utils/` (e.g., `preann_pdf_generate.py`)
 - README: `<project_root>/README.md`
+- Docs (writeups, ablations, changelog): `<project_root>/docs/` (`changes.md`, `plans.md`, `embedding-ablation.md`)

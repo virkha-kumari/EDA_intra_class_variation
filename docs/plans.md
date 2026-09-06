@@ -6,7 +6,9 @@ Planned changes in rough priority order. Move items to `changes.md` once done an
 
 ## Qwen PreAnn Workflow (Gradio App) — `preann_qwen_workflow/`
 
-**Status:** Architecture designed, `utils/test_qwen.py` written to validate Qwen3-VL API. Build after test_qwen.py passes and is satisfactory.
+**Status:** PAUSED (2026-09-06) — multimodal exploration in `test_qwen.py` not yet working as required. Deprioritized for higher-priority work; resume when picked back up.
+
+Architecture designed, `utils/test_qwen.py` written to validate Qwen3-VL API. Build after test_qwen.py passes and is satisfactory.
 
 **Concept:** Reinovates the current PreAnn script with a Qwen3-VL-based Gradio app for richer pre-annotation analysis.
 

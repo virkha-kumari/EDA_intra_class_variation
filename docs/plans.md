@@ -54,11 +54,6 @@ Architecture designed, `utils/test_qwen.py` written to validate Qwen3-VL API. Bu
 - can be viewed over a dashboard or something with images saved / persisted under assets and if that saved us the hassle of generating documents
 - https://diffprog.slack.com/archives/C06Q7DXJDUJ/p1777549467871949
 
-## Missing Labels Handling
-- Detect and report frames that are missing annotation label files
-- Surface this info clearly in the PDF report or terminal output
-- Decide: hard error vs warning vs skip-and-count
-
 ## Integrate Interactive Cluster Viewer into Master Scripts
 - Fold `interactive_cluster_viewer.py` as an optional step inside the master script prompts
 - User sees: "Generate interactive HTML viewer? [Y/n]"

@@ -210,11 +210,21 @@ def parse_args():
     p.add_argument("--pdf_name", type=str, default=None)
     p.add_argument("--pdf_quality", type=int, default=75)
     p.add_argument("--contrastive_groups_json", type=str, default=None)
+    # USB missed-label detection (runs after PDF, before crop deletion)
+    p.add_argument("--usb_classes", nargs="+", default=None,
+                   help="Class names to check for missed labels (omit = skip USB)")
+    p.add_argument("--usb_sim_thresholds", nargs="+", type=float, default=None,
+                   help="Cosine sim threshold per USB class (single value = applied to all; default 0.8)")
+    p.add_argument("--usb_n_farthest", type=int, default=4)
+    p.add_argument("--usb_only", action="store_true",
+                   help="Run only crops + embeddings + USB for --usb_classes (skips clustering and PDF)")
     args = p.parse_args()
     if not args.interactive:
         missing = [f for f, v in [("--imgs_path", args.imgs_path), ("--label_path", args.label_path), ("--classes_txt", args.classes_txt)] if v is None]
         if missing:
             p.error(f"Non-interactive mode requires: {', '.join(missing)}")
+    if args.usb_only and not args.usb_classes:
+        p.error("--usb_only requires --usb_classes")
     return args
 
 
@@ -261,6 +271,36 @@ def main():
         print(f"\n✅  Loaded {len(class_names)} classes from {classes_txt}")
 
         ## -----------------------------------------------##
+        ##   RUN MODE + USB (Use-Seen-Before) inputs       ##
+        ## -----------------------------------------------##
+        _MODE_EDA, _MODE_EDA_USB, _MODE_USB = (
+            "Full EDA pipeline (clustering + PDF)",
+            "Full EDA pipeline + USB missed-label check",
+            "USB missed-label check only (crops + embeddings + USB, no clustering/PDF)",
+        )
+        run_mode = _ask(questionary.select("What do you want to run?",
+                                           choices=[_MODE_EDA, _MODE_EDA_USB, _MODE_USB]))
+        usb_only = run_mode == _MODE_USB
+        usb_classes, usb_sim_thresholds, usb_n_farthest = [], [], 4
+        if run_mode != _MODE_EDA:
+            while not usb_classes:
+                usb_classes = _ask(questionary.checkbox(
+                    "Tick classes you suspect have missed labels", choices=class_names))
+                if not usb_classes:
+                    if usb_only:
+                        print("  ⚠️  USB-only mode needs at least one class.")
+                    else:
+                        print("  ℹ️  No classes ticked — USB skipped")
+                        break
+            for c in usb_classes:
+                usb_sim_thresholds.append(float(_prompt_text(
+                    f"Sim threshold for '{c}' (0.8=balanced, higher=stricter)", 0.8)))
+            if usb_classes:
+                usb_n_farthest = int(_prompt_text(
+                    "Farthest points per cluster in reference pool", 4))
+                print(f"  ✅ USB will check {len(usb_classes)} class(es)")
+
+        ## -----------------------------------------------##
         ##   RESULTS DIRECTORY (fixed, not changeable)      ##
         ## -----------------------------------------------##
         RESULTS_DIR = "postann_pretrain_results"
@@ -297,9 +337,9 @@ def main():
             save_suffix = "embeddings_dinov2.npy"
             num_workers = 4
 
-        # Clustering flags
+        # Clustering flags (auto-tune/eps/min_pts also drive USB's reference-pool DBSCAN)
         auto_tune        = _ask(questionary.confirm("Enable auto-tune eps?", default=True))
-        save_class_scatter = _ask(questionary.confirm("Save per-class UMAP scatter plots? (slow — runs UMAP per class)", default=False))
+        save_class_scatter = False if usb_only else _ask(questionary.confirm("Save per-class UMAP scatter plots? (slow — runs UMAP per class)", default=False))
 
         # Cluster Handling — conditionally prompt eps OR percentile
         if auto_tune:
@@ -309,7 +349,11 @@ def main():
             epsilon = float(_prompt_text("DBSCAN epsilon (0.10=strict, 0.15=balanced, 0.20-0.30=lenient)", 0.15))
             auto_tune_percentile = 95  # unused fallback
 
-        if change_defaults:
+        if change_defaults and usb_only:
+            min_pts             = int(_prompt_text("Min points per cluster", 3))
+            umap_min_dist, max_cluster_samples, pca_components = 0.05, 20, 0
+            uniform_class_eps_threshold, uniform_class_downsample_target, uniform_class_min_samples = 0.1, 4000, 12000
+        elif change_defaults:
             min_pts             = int(_prompt_text("Min points per cluster", 3))
             umap_min_dist       = float(_prompt_text("UMAP min_dist (lower=tighter packing)", 0.05))
             max_cluster_samples = int(_prompt_text("Max sample images saved per cluster", 20))
@@ -331,7 +375,7 @@ def main():
 
         # PDF handling
         temp_file    = os.path.join(cropped_bbox_dir, "temp_ann_file.txt")
-        pdf_generate = _ask(questionary.confirm("Generate PDF report?", default=True))
+        pdf_generate = False if usb_only else _ask(questionary.confirm("Generate PDF report?", default=True))
         pdf_name     = _prompt_text("Output PDF filename (no extension)", _default_pdf_name) if pdf_generate else _default_pdf_name
         pdf_quality  = int(_prompt_text("PDF image quality (1-95, 75=balanced, 90=high, 50=small file)", 75)) if change_defaults and pdf_generate else 75
 
@@ -448,10 +492,23 @@ def main():
         uniform_class_eps_threshold     = args.uniform_eps_threshold
         uniform_class_downsample_target = args.uniform_downsample_target
         uniform_class_min_samples       = args.uniform_min_samples
-        pdf_generate            = args.pdf
+        usb_only                = args.usb_only
+        pdf_generate            = False if usb_only else args.pdf
         pdf_name                = args.pdf_name if args.pdf_name else f"PDF_REPORT_{_folder_name}"
         pdf_quality             = args.pdf_quality
         contrastive_groups_json = args.contrastive_groups_json
+
+        usb_classes    = args.usb_classes or []
+        usb_n_farthest = args.usb_n_farthest
+        if usb_classes:
+            thr = args.usb_sim_thresholds or [0.8]
+            if len(thr) == 1:
+                thr = thr * len(usb_classes)
+            if len(thr) != len(usb_classes):
+                sys.exit("--usb_sim_thresholds must be a single value or one per --usb_classes entry")
+            usb_sim_thresholds = thr
+        else:
+            usb_sim_thresholds = []
 
         temp_file = os.path.join(cropped_bbox_dir, "temp_ann_file.txt")
 
@@ -472,15 +529,16 @@ def main():
     logger.info(f"cropped_bbox_dir={cropped_bbox_dir}  output_cluster_dir={output_cluster_dir}")
     logger.info(f"batch_size={batch_size}  num_workers={num_workers}  auto_tune={auto_tune}  auto_tune_percentile={auto_tune_percentile}  epsilon={epsilon}")
     logger.info(f"pdf={pdf_generate}  pdf_quality={pdf_quality}  pca_components={pca_components}")
+    logger.info(f"usb_only={usb_only}  usb_classes={usb_classes}  usb_sim_thresholds={usb_sim_thresholds}  usb_n_farthest={usb_n_farthest}")
 
-    # Classes to ids and etc
-    class_ids = [str(i) for i in range(len(class_names))]
+    # Classes to ids and etc — USB-only mode crops/embeds just the USB classes
+    class_ids = [str(i) for i, name in enumerate(class_names) if not usb_only or name in usb_classes]
     class_ids_to_names = []
     for i, name in enumerate(class_names):
         class_ids_to_names.extend([str(i), name])
 
 
-    total_steps = 4 if pdf_generate else 3
+    total_steps = 3 if usb_only else 3 + int(pdf_generate) + int(bool(usb_classes))
 
     if not skip_to_clustering:
         # Step 1: Crop YOLO bboxes -- Only send temp txt file if requested for PDF Generation
@@ -526,37 +584,40 @@ def main():
         print(f"\n⏭️  STEP 1 & 2 SKIPPED — using existing crops + embeddings in: {cropped_bbox_dir}")
 
 
-    # Step 3: Cluster using DBSCAN to visualize
-    print("\n" + "="*60)
-    print(f"STEP 3/{total_steps}: CLUSTERING ANALYSIS")
-    print("="*60)
-    cluster_args = [
-        "--root", cropped_bbox_dir,
-        "--eps", str(epsilon),
-        "--min_samples", str(min_pts),
-        "--output_dir", output_cluster_dir,
-        "--max_samples", str(max_cluster_samples),
-        "--save_suffix", save_suffix,
-        "--auto_tune_percentile", str(auto_tune_percentile),
-        "--umap_min_dist", str(umap_min_dist),
-        "--save_montage",
-        "--uniform_eps_threshold", str(uniform_class_eps_threshold),
-        "--uniform_downsample_target", str(uniform_class_downsample_target),
-        "--uniform_min_samples", str(uniform_class_min_samples),
-        "--pca_components", str(pca_components)
-    ]
-    if auto_tune:
-        cluster_args.append("--auto_tune")
-    if save_class_scatter:
-        cluster_args.append("--save_class_scatter")
+    # Step 3: Cluster using DBSCAN to visualize (skipped in USB-only — Script 5 clusters in-process)
+    if usb_only:
+        print("\n⏭️  STEP 3 (clustering) & PDF SKIPPED — USB-only mode")
+    else:
+        print("\n" + "="*60)
+        print(f"STEP 3/{total_steps}: CLUSTERING ANALYSIS")
+        print("="*60)
+        cluster_args = [
+            "--root", cropped_bbox_dir,
+            "--eps", str(epsilon),
+            "--min_samples", str(min_pts),
+            "--output_dir", output_cluster_dir,
+            "--max_samples", str(max_cluster_samples),
+            "--save_suffix", save_suffix,
+            "--auto_tune_percentile", str(auto_tune_percentile),
+            "--umap_min_dist", str(umap_min_dist),
+            "--save_montage",
+            "--uniform_eps_threshold", str(uniform_class_eps_threshold),
+            "--uniform_downsample_target", str(uniform_class_downsample_target),
+            "--uniform_min_samples", str(uniform_class_min_samples),
+            "--pca_components", str(pca_components)
+        ]
+        if auto_tune:
+            cluster_args.append("--auto_tune")
+        if save_class_scatter:
+            cluster_args.append("--save_class_scatter")
 
-    run_step("postannotation_scripts/3. clustering_of_classes_embeddings.py",
-             cluster_args, cool_down_after=False, logger=logger, interactive=args.interactive)
+        run_step("postannotation_scripts/3. clustering_of_classes_embeddings.py",
+                 cluster_args, cool_down_after=False, logger=logger, interactive=args.interactive)
 
     # Step 4 (Optional): Generate PDF Report
     if pdf_generate:
         print("\n" + "="*60)
-        print("STEP 4/4: GENERATING PDF REPORT")
+        print(f"STEP 4/{total_steps}: GENERATING PDF REPORT")
         print("="*60)
         pdf_args = [
             "--temp_txt_file", temp_file,
@@ -578,6 +639,31 @@ def main():
         print("\n" + "="*60)
         print(f"📄 PDF Report generated: {os.path.join(output_cluster_dir, pdf_name)}.pdf")
         print("="*60)
+
+    # Step 5 (Optional): USB missed-label detection — needs crops dir (.npy) so runs before deletion
+    if usb_classes:
+        print("\n" + "="*60)
+        print(f"STEP {total_steps}/{total_steps}: USB MISSED-LABEL DETECTION")
+        print("="*60)
+        usb_args = [
+            "--imgs_path", imgs_path,
+            "--label_path", label_path,
+            "--classes_txt", classes_txt,
+            "--cropped_dir", cropped_bbox_dir,
+            "--output_dir", output_cluster_dir,
+            "--usb_classes"] + usb_classes + [
+            "--sim_thresholds"] + [str(t) for t in usb_sim_thresholds] + [
+            "--n_farthest", str(usb_n_farthest),
+            "--save_suffix", save_suffix,
+            "--batch", str(batch_size),
+            "--min_samples", str(min_pts),
+            "--auto_tune_percentile", str(auto_tune_percentile),
+            "--eps", str(epsilon),
+        ]
+        if auto_tune:
+            usb_args.append("--auto_tune")
+        run_step("postannotation_scripts/5. usb_missed_labels.py", usb_args, cool_down_after=False, logger=logger, interactive=args.interactive)
+        print(f"\n🚩 USB results: {os.path.join(output_cluster_dir, 'missing_labels')}/")
 
     # Non-interactive: always delete intermediate crops after pipeline finishes
     if not args.interactive and os.path.isdir(cropped_bbox_dir):
@@ -621,6 +707,8 @@ def main():
     print(f"  Clustering Results: {output_cluster_dir}/")
     if pdf_generate:
         print(f"  PDF Report:         {os.path.join(output_cluster_dir, pdf_name)}.pdf")
+    if usb_classes:
+        print(f"  USB Missed Labels:  {os.path.join(output_cluster_dir, 'missing_labels')}/")
     print("="*60)
 
 if __name__ == "__main__":

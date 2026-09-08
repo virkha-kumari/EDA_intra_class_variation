@@ -28,6 +28,7 @@ Guidance for Claude Code (claude.ai/code) when working with code in this reposit
 | `postannotation_scripts/2. save_dinov2_embeddings_per_class.py` | Generate DINOv2 embeddings | Part of both pipelines |
 | `postannotation_scripts/3. clustering_of_classes_embeddings.py` | DBSCAN clustering analysis | Part of both pipelines |
 | `postannotation_scripts/4. generate_pdf.py` | Generate PDF reports combining dataset stats + clustering results | Part of both pipelines |
+| `postannotation_scripts/5. usb_missed_labels.py` | USB (Use-Seen-Before): flag images with missed labels for a class | Optional Step 5 of pretrain pipeline |
 | `utils/preann_pdf_generate.py` | PDF/montage generation for pre-annotation pipeline | Imported by DINOv2 PreAnn master script |
 | `master_scripts/1. interactive_cluster_viewer.py` | Optional: Interactive Plotly HTML viewer | Optional addon |
 
@@ -45,6 +46,8 @@ python "master_scripts/master_script_dinov2_PreAnn.py"    # Pre-annotation
 python "master_scripts/master_script_dinov2_PostAnn_PreTrain.py"  # Pre-training
 python "master_scripts/master_script_dinov2_PostTrain.py"         # Post-training (not in exec.bat)
 ```
+
+The pre-training master script asks a run mode right after `classes.txt`: **Full EDA** / **Full EDA + USB** / **USB only** (crops + embeddings + USB for selected classes, no clustering/PDF).
 
 Both master scripts support two modes:
 - **Interactive** (default): questionary prompts — path autocomplete, Yes/No confirms, "Change default parameters?" gate
@@ -139,7 +142,8 @@ Input (annotated images OR video+model)
     |
     v (optional)
 [Script 4] PDF report generator --> <results>/clustering_results/output.pdf (combines Script 1 + 3 results)
-[Script 5] Interactive viewer --> <results>/clustering_results/<class>_interactive.html
+[Script 5] USB missed labels --> <results>/clustering_results/missing_labels/<class>/<image>.jpg
+[Interactive viewer] --> <results>/clustering_results/<class>_interactive.html
 ```
 
 ### Key Data Structures
@@ -154,7 +158,8 @@ Input (annotated images OR video+model)
 - Script 2 → Reads class folders, creates `.npy` + `_image_list.txt`
 - Script 3 → Reads embeddings + mapping file, creates visualizations + `cluster_statistics.csv`
 - Script 4 → Reads `temp_ann_file.txt` (Script 1) + clustering results (Script 3), generates PDF
-- Script 5 → (Optional) Reads embeddings, creates interactive HTML (independent of Scripts 3 & 4)
+- Script 5 (USB) → Reads Script 2's `.npy` embeddings + original images/labels; imports Script 2's `compute_embeddings_for_paths` and Script 3's `auto_tune_eps`/`cluster_single_class` via `importlib` (filenames contain spaces). Independent of Script 3's on-disk output.
+- Interactive viewer → (Optional) Reads embeddings, creates interactive HTML (independent of Scripts 3 & 4)
 
 **Critical**:
 - If Script 2 changes output format, Script 3 must be updated to match!
@@ -198,6 +203,13 @@ All parameters configured via interactive prompts. Clustering params always aske
 - `--uniform_downsample_target`: Target sample count when downsampling uniform classes (default: 5000) — master script overrides to 4000
 - `--uniform_min_samples`: Only downsample if class has more than this many samples (default: 10000) — master script overrides to 12000
 
+### USB Missed-Label Detection (Script 5)
+- `--usb_classes` / `--sim_thresholds`: class names + one cosine-sim threshold each (default 0.8; master prompts per class)
+- `--n_farthest`: farthest-from-centroid points per cluster added to reference pool (default 4)
+- `--region_iou`: IoU for BOTH region dedup and same-image GT suppression (default 0.8)
+- `--pad`: region padding as fraction of image W/H per side (default 0.02)
+- Master script args: `--usb_classes`, `--usb_sim_thresholds` (single value broadcasts to all classes), `--usb_n_farthest`, `--usb_only`
+
 ### Video Processing (Script 1 post-training)
 - `--frame_stride`: Process every Nth frame (3 = 10fps for 30fps video)
 - `--num_frames`: Target samples per class (uniform sampling)
@@ -234,6 +246,10 @@ All parameters configured via interactive prompts. Clustering params always aske
 13. **Contrastive distribution chart**: When `--contrastive_groups_json` provided (JSON `{group_name: [class_a, class_b]}`), Script 4 renders second grouped horizontal bar chart **after** plain annotation chart (plain chart always shown). Only grouped classes appear — ungrouped not appended. One row per group, sub-bars per variant, palette `['#3a7fc1', '#d95f49', ...]`. Legend labels derived from last `_`-token of class name at each variant position (if all groups agree on token); falls back to `Variant N`. Master script prompts via `questionary.checkbox` — user ticks class names to form groups, auto-names as `"A vs B"` (editable). Backward compatible — no arg = plain chart only.
 14. **PDF Insights & Recommendations page**: Script 4 appends final page after montages — **issue-centric layout** grouped by severity (🔴 Critical → 🟡 Warning → 🟢 OK → ℹ Info). Each row = one unique issue type; "Classes Affected" column lists all classes that triggered it. Max ~1 page regardless of class count. 13 rules evaluated: outlier rate, cluster count, all-noise, tight-core+noise, insufficient data, low sample count, systematic noise, eps spread, over-fragmentation, over-clustering on small class, homogeneous OK, zero outliers, large class downsampled. No class-imbalance row. `n_samples` parsed as both plain int and `"clustered/total"` string.
 15. **Duplicate image basename detection**: Script 1 detects per-split basenames with multiple image formats (e.g. `foo.png` + `foo.jpg` in same folder). Count written to temp txt under `DUPLICATE IMAGE BASENAMES` section. Script 4 parses it and shows row in Dataset Overview table + file detail in Annotation Issue Files block.
+16. **USB (Script 5) reuses Script 2/3 code, not their on-disk output**: Script 3 never persists per-sample cluster labels (only class-level `cluster_statistics.csv`), and for "uniform" downsampled classes its in-memory labels aren't even row-aligned with the full `.npy`. So USB re-runs DBSCAN in-process on Script 2's cached embeddings (cheap — pure array math, no GPU, no image I/O) and must NOT call Script 3's `save_cluster_samples`/`create_cluster_montage` (montage saving is the slow part on 50K+ sample classes; clustering itself is fast).
+17. **USB region assumption**: `seen_<cls>_regions` are fixed pixel locations reused across every image — valid only for fixed-camera (CCTV) datasets. Padding is 2% of **image** W/H per side (deliberately NOT box-relative, which is the convention in the sibling `Auto_Ann_work` repo).
+18. **USB target walk is unavoidable**: no script persists a full dataset image/label manifest (Script 1 holds per-split filename sets in memory, writes only capped/aggregate counts to `temp_ann_file.txt`), so USB does its own `_detect_splits` + `os.listdir` walk. Deliberate decision — not worth a Script 1 change.
+19. **USB-only mode**: master script Step 0 asks run mode (Full EDA / Full EDA + USB / USB only). USB-only crops+embeds ONLY the selected classes (`class_ids` filtered), skips Step 3 clustering and PDF entirely. Headless equivalent: `--usb_only` (requires `--usb_classes`). Clustering params (`auto_tune`, `epsilon`, `min_pts`, `auto_tune_percentile`) are still prompted/passed in USB-only mode because USB's own reference-pool DBSCAN uses them.
 
 ## File Naming Patterns
 
@@ -251,6 +267,7 @@ All parameters configured via interactive prompts. Clustering params always aske
   - Custom: `custom_emb.npy` + `custom_emb_image_list.txt`
 - Script 3 outputs: `{class}_clusters.png` (if `--save_class_scatter`), `{class}_montage.png` (if `--save_montage`), `cluster_statistics.csv`, `centroid_overview_N.png`
 - Script 4 outputs: `{pdf_name}.pdf` + `temp_pdf_charts/` directory with temp JPEG chunks (auto-cleaned)
+- Script 5 (USB) outputs: `missing_labels/<class>/{split_}{image_name}.jpg` (full frame, flagged regions red + sim score, existing GT boxes green) inside the clustering results dir. Candidate crops staged in `missing_labels/_temp_crops/<class>/` and deleted after embedding.
 
 ### Pre-Training Master Script Output Naming (folder-name-derived)
 Pre-training master script derives all output names from images folder name (`{FolderName}`) at prompt time:
@@ -314,4 +331,4 @@ Always prompted with derived default shown — user can accept or override.
 - Core scripts (1, 2, 3) for Post-annotation: `<project_root>/postannotation_scripts/`
 - Utility modules: `<project_root>/utils/` (e.g., `preann_pdf_generate.py`)
 - README: `<project_root>/README.md`
-- Docs (writeups, ablations, changelog): `<project_root>/docs/` (`changes.md`, `plans.md`, `embedding-ablation.md`)
+- Docs (writeups, ablations, changelog): `<project_root>/docs/` (`changes.md`, `plans.md`, `embedding-ablation.md`, `usb-missed-labels-ablation.md`)

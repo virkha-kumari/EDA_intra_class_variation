@@ -60,6 +60,20 @@ Short version: PaCMAP for "are my scenes diverse?" (global), UMAP for "do my cro
 
 ---
 
+### Missed labels: remembered regions (USB) instead of a detector
+
+Clustering only ever sees boxes that **exist**. An object present in the frame but never labelled produces no crop, no embedding, no outlier — it's invisible to the rest of this pipeline, and it teaches the detector that those pixels are background.
+
+The obvious fix is to auto-annotate and diff against the human labels. That was tried first, in a separate repo ([Auto_Annotation_YOLO_formatted](https://github.com/virkha-kumari/Auto_Annotation_YOLO_formatted)), across SAM2, SAM3, OWLv2 and YOLOe. It works, but not well enough to audit with: mAP@.50 = 0.254, and the visually ambiguous classes — gloves F1=0.11, goggles precision=0.023 — are exactly the ones most likely to get missed by a human in the first place.
+
+USB (Use-Seen-Before) drops the localization problem instead of solving it. The dataset is fixed-camera CCTV, so a class recurs in the same handful of image regions; those regions are already recorded in the existing ground truth. USB reuses them as the region proposer and spends its only model call on the question that actually matters — *is the object there this time?* — via DINOv2 similarity against the class's own cached embeddings.
+
+The trade: it can't find an instance somewhere the class has never been annotated, and it breaks if the camera moves. In exchange it needs one model instead of three, reuses embeddings the pipeline already computed, and flags frames for human review rather than claiming boxes are correct.
+
+Full narrative — what failed, why, and where the idea came from: [docs/usb-missed-labels-ablation.md](docs/usb-missed-labels-ablation.md).
+
+---
+
 ## Quick Start
 
 Always run from project root. The launcher shows a menu: option 1 = pre-annotation, option 2 = pre-training. Post-training isn't in the menu — run it directly.
@@ -166,6 +180,8 @@ Use after annotation to understand intra-class variation — are your classes ho
 5. k-NN percentile (if auto-tune on) or manual epsilon (if off)
 6. Generate PDF?
 
+Run mode is asked first (right after classes.txt): **Full EDA** / **Full EDA + USB** / **USB only**. USB-only skips clustering and PDF, crops and embeds just the selected classes, then runs USB.
+
 **Default values** (master script defaults — override the individual script's own defaults):
 
 | Parameter | Default | Description |
@@ -183,6 +199,9 @@ Use after annotation to understand intra-class variation — are your classes ho
 | `uniform_min_samples` | 12000 | Trigger downsampling only if class exceeds this (overrides Script 3's default of 10000) |
 | `use_embedding_cache` | True | Skip re-generation if embeddings exist |
 | `num_workers` | 4 | Crop extraction threads (behind "Change defaults?" gate) |
+| `usb_classes` | none | Classes to check for missed labels (headless `--usb_classes a b`; omit = no USB) |
+| `usb_sim_thresholds` | 0.8 | Cosine sim threshold per USB class (headless: one value for all, or one per class) |
+| `usb_n_farthest` | 4 | Farthest-from-centroid points per cluster added to the USB reference pool |
 
 **PDF prompts** (after basic setup, when PDF generation is on):
 - "Group contrastive class pairs in distribution chart?" — if Yes, tick class names from a checkbox list to form named groups (e.g., "fit vs wrong_fit"). A second grouped horizontal bar chart is added **after** the plain annotation chart, showing only the grouped classes. Legend labels are auto-inferred from class name suffixes (falls back to "Variant N").
@@ -198,6 +217,7 @@ Use after annotation to understand intra-class variation — are your classes ho
 2. `postannotation_scripts/2. save_dinov2_embeddings_per_class.py` — generate embeddings
 3. `postannotation_scripts/3. clustering_of_classes_embeddings.py` — DBSCAN clustering
 4. `postannotation_scripts/4. generate_pdf.py` — PDF report (optional)
+5. `postannotation_scripts/5. usb_missed_labels.py` — USB missed-label detection (optional)
 
 ---
 
@@ -399,6 +419,38 @@ python "postannotation_scripts/4. generate_pdf.py" \
 
 PDF structure: Page 1 = dataset overview table (includes Duplicate Image Basenames row) → pipeline config table → annotation distribution bar chart (always) → contrastive group chart (only if `--contrastive_groups_json` provided, grouped classes only) → per-class clustering summary table (+ annotation issue files detail if any issues found). Pages 2–N = centroid overview plots (`centroid_overview_N.png`). Remaining pages = per-class montages (split at cluster row boundaries, never mid-cluster). Last page = Insights & Recommendations — issue-centric, grouped by severity (🔴 Critical → 🟡 Warning → 🟢 OK → ℹ Info); each row is one issue type listing all affected classes. No class-imbalance row.
 
+### postannotation_scripts/5. usb_missed_labels.py
+
+USB (Use-Seen-Before) — flags images that probably contain an **unlabelled** instance of a class. Usually invoked by the pre-training master script (Step 5, after the PDF, before crops are deleted). Standalone use:
+
+```bash
+python "postannotation_scripts/5. usb_missed_labels.py" \
+    --imgs_path path/to/images --label_path path/to/labels \
+    --classes_txt path/to/classes.txt \
+    --cropped_dir postann_pretrain_results/cropped_imgs_by_class_MyDataset \
+    --output_dir postann_pretrain_results/clustering_results_MyDataset \
+    --usb_classes screw holder --sim_thresholds 0.8 0.85 \
+    --auto_tune --auto_tune_percentile 90 --min_samples 3
+```
+
+Requires Script 2's `<class>/embeddings_dinov2.npy` to already exist in `--cropped_dir`.
+
+| Arg | Default | Notes |
+|---|---|---|
+| `--usb_classes` | required | Class names to check (must match `classes.txt`) |
+| `--sim_thresholds` | required | One cosine-sim threshold per class, same order |
+| `--n_farthest` | 4 | Farthest-from-centroid points per cluster in the reference pool |
+| `--region_iou` | 0.8 | IoU for region dedup **and** for suppressing already-labelled instances |
+| `--pad` | 0.02 | Region padding, fraction of **image** W/H per side |
+| `--batch` | 64 | DINOv2 batch size for candidate crops |
+| `--min_samples` / `--auto_tune` / `--auto_tune_percentile` / `--eps` | 3 / off / 90 / 0.15 | DBSCAN params for the in-process reference-pool clustering (master script passes the same values as Step 3) |
+
+**How it works**: every GT box of the class is collected across all splits and greedy-deduped at IoU < `--region_iou` into `seen_<cls>_regions` (fixed pixel locations — assumes a fixed camera). Each region is padded and cropped out of **every** image in the dataset; a candidate is dropped if it overlaps a GT box of the same class in that same image. Candidates are embedded with Script 2's own DINOv2 function and scored by max cosine similarity against a reference pool built from the class's cached embeddings — DBSCAN noise points, plus each cluster's centroid and its N farthest members. Above threshold → flagged.
+
+**Output**: `<output_dir>/missing_labels/<class>/<image>.jpg` — the full frame with flagged regions in red (labelled with the sim score) and existing GT boxes of that class in green.
+
+Why this exists instead of running a detector, and what was tried first: [docs/usb-missed-labels-ablation.md](docs/usb-missed-labels-ablation.md).
+
 ### master_scripts/1. interactive_cluster_viewer.py (optional)
 
 Interactive Plotly HTML explorer. Run after Script 2, independent of Script 3.
@@ -430,6 +482,7 @@ python "master_scripts/1. interactive_cluster_viewer.py" \
 | 1 cluster | Class is visually homogeneous — nothing to split |
 | 5+ clusters | Check montages first — if clusters are semantic, consider sub-classes; if viewpoint/lighting artifacts, ignore |
 | >20% outliers | Check outlier folder — annotation errors or genuinely rare appearances |
+| Suspect a class has unlabelled instances | Run USB (Step 5) on that class — review `missing_labels/<class>/` frames |
 | Class imbalance >10x flagged | Add more data for underrepresented class before training |
 
 ---
@@ -446,6 +499,7 @@ python "master_scripts/1. interactive_cluster_viewer.py" \
 | `postannotation_scripts/2. save_dinov2_embeddings_per_class.py` | Manual: generate embeddings |
 | `postannotation_scripts/3. clustering_of_classes_embeddings.py` | Manual: DBSCAN clustering |
 | `postannotation_scripts/4. generate_pdf.py` | Manual: generate PDF report |
+| `postannotation_scripts/5. usb_missed_labels.py` | Manual: flag images with missed labels for a class |
 
 ---
 

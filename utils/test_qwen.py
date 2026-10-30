@@ -8,6 +8,7 @@ Phase 3: Text-embed each caption (same model, text-only) → retrieve top-1 from
 """
 
 import gc
+import os
 import torch
 import numpy as np
 from PIL import Image
@@ -18,8 +19,8 @@ from qwen_vl_utils import process_vision_info
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
-FRAMES_DIR = Path("/home/retrocausal-train/Documents/EDA_TOOL/EDA_intra_class_variation/test_frames")  # query frames
-CHECK_DIR  = Path("/home/retrocausal-train/Documents/EDA_TOOL/EDA_intra_class_variation/check_frames")  # retrieval pool
+FRAMES_DIR = Path(os.environ.get("EDA_TEST_FRAMES", "test_frames"))   # query frames
+CHECK_DIR  = Path(os.environ.get("EDA_CHECK_FRAMES", "check_frames"))  # retrieval pool
 MAX_FRAMES = 20
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 

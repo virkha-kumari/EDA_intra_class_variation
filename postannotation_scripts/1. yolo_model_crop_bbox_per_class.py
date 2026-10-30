@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+⚠️  DEPRECATED — NOT MAINTAINED (post-training workflow only; see master_script_dinov2_PostTrain.py).
+Known issues left unfixed: multiple detections of a class in one frame overwrite each other
+(frame_{idx}.png), and --num_frames is not met after frame dedup.
+
 YOLO model inference script that:
 1. Processes video frames and collects annotations for specified classes
 2. Smart samples frames to get evenly distributed 100 frames per class

@@ -196,6 +196,7 @@ def parse_args():
     # Clustering
     p.add_argument("--auto_tune", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--save_class_scatter", action="store_true", default=False)
+    p.add_argument("--eps_method", choices=["knee", "percentile"], default="knee")
     p.add_argument("--auto_tune_percentile", type=int, default=90)
     p.add_argument("--epsilon", type=float, default=0.15)
     p.add_argument("--min_pts", type=int, default=3)
@@ -342,8 +343,13 @@ def main():
         save_class_scatter = False if usb_only else _ask(questionary.confirm("Save per-class UMAP scatter plots? (slow — runs UMAP per class)", default=False))
 
         # Cluster Handling — conditionally prompt eps OR percentile
+        eps_method = "knee"
         if auto_tune:
-            auto_tune_percentile = int(_prompt_text("Auto-tune k-NN percentile (90=tight, 95=balanced, 98=loose)", 90))
+            eps_method = _ask(questionary.select(
+                "Auto-tune eps rule (knee = data-driven outlier rate; percentile caps outliers near 100-p%)",
+                choices=["knee", "percentile"], default="knee"))
+            auto_tune_percentile = (int(_prompt_text("Auto-tune k-NN percentile (90=tight, 95=balanced, 98=loose)", 90))
+                                    if eps_method == "percentile" else 90)
             epsilon = 0.15  # unused fallback
         else:
             epsilon = float(_prompt_text("DBSCAN epsilon (0.10=strict, 0.15=balanced, 0.20-0.30=lenient)", 0.15))
@@ -419,7 +425,20 @@ def main():
         if os.path.isdir(cropped_bbox_dir):
             # Check if embeddings already exist in any class subfolder
             existing_embs = list(Path(cropped_bbox_dir).rglob(save_suffix))
-            if existing_embs:
+            # Embeddings from older DINOv2 preprocessing can't be mixed with fresh ones (USB, re-runs)
+            import importlib.util
+            _spec = importlib.util.spec_from_file_location(
+                "script2", "postannotation_scripts/2. save_dinov2_embeddings_per_class.py")
+            _script2 = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_script2)
+            stale_embs = [e for e in existing_embs if _script2.cached_tag(e) != _script2.PREPROC_TAG]
+            if stale_embs:
+                print(f"\n⚠️  {len(stale_embs)} cached embedding file(s) use older/unknown DINOv2 preprocessing "
+                      f"— they must be regenerated.")
+                print(f"   🗑️  Deleting: {os.path.abspath(cropped_bbox_dir)}")
+                shutil.rmtree(os.path.abspath(cropped_bbox_dir))
+                existing_embs = []
+            elif existing_embs:
                 print(f"\n✅  Cropped images folder already exists WITH embeddings ({len(existing_embs)} class(es)):")
                 print(f"   {os.path.abspath(cropped_bbox_dir)}")
                 if pdf_generate:
@@ -483,6 +502,7 @@ def main():
         num_workers             = args.num_workers
         auto_tune               = args.auto_tune
         save_class_scatter      = args.save_class_scatter
+        eps_method              = args.eps_method
         auto_tune_percentile    = args.auto_tune_percentile
         epsilon                 = args.epsilon
         min_pts                 = args.min_pts
@@ -527,7 +547,7 @@ def main():
     logger.info("Pipeline started")
     logger.info(f"imgs_path={imgs_path}  label_path={label_path}  classes_txt={classes_txt}")
     logger.info(f"cropped_bbox_dir={cropped_bbox_dir}  output_cluster_dir={output_cluster_dir}")
-    logger.info(f"batch_size={batch_size}  num_workers={num_workers}  auto_tune={auto_tune}  auto_tune_percentile={auto_tune_percentile}  epsilon={epsilon}")
+    logger.info(f"batch_size={batch_size}  num_workers={num_workers}  auto_tune={auto_tune}  eps_method={eps_method}  auto_tune_percentile={auto_tune_percentile}  epsilon={epsilon}")
     logger.info(f"pdf={pdf_generate}  pdf_quality={pdf_quality}  pca_components={pca_components}")
     logger.info(f"usb_only={usb_only}  usb_classes={usb_classes}  usb_sim_thresholds={usb_sim_thresholds}  usb_n_farthest={usb_n_farthest}")
 
@@ -598,6 +618,7 @@ def main():
             "--output_dir", output_cluster_dir,
             "--max_samples", str(max_cluster_samples),
             "--save_suffix", save_suffix,
+            "--eps_method", eps_method,
             "--auto_tune_percentile", str(auto_tune_percentile),
             "--umap_min_dist", str(umap_min_dist),
             "--save_montage",
@@ -626,6 +647,7 @@ def main():
             "--imgs_path", imgs_path,
             "--label_path", label_path,
             "--classes_txt", classes_txt,
+            "--eps_method", eps_method,
             "--auto_tune_percentile", str(auto_tune_percentile),
             "--epsilon", str(epsilon),
             "--pdf_quality", str(pdf_quality),
@@ -657,6 +679,7 @@ def main():
             "--save_suffix", save_suffix,
             "--batch", str(batch_size),
             "--min_samples", str(min_pts),
+            "--eps_method", eps_method,
             "--auto_tune_percentile", str(auto_tune_percentile),
             "--eps", str(epsilon),
         ]

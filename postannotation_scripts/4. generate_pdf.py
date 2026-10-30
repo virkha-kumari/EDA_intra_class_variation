@@ -278,7 +278,7 @@ def find_montage_images(clustering_dir, class_name):
     """
     clustering_path = Path(clustering_dir)
 
-    # Check for multi-part files first (e.g. black_bin_montage_part1.jpg)
+    # Check for multi-part files first (e.g. <class>_montage_part1.jpg)
     parts = []
     for ext in ('.jpg', '.png'):
         pattern = f"{class_name}_montage_part*{ext}"
@@ -545,7 +545,7 @@ def _generate_insights_page(cluster_df, stats, story, heading_style, normal_styl
 
         if eps_used < 0.05 and n_clusters > 5:
             _add('over_frag', 'warning', 'Over-fragmented at tight eps',
-                 'Many micro-clusters; may be noise-sensitive — try raising auto_tune_percentile', cls)
+                 'Many micro-clusters; may be noise-sensitive — try a looser eps (raise the percentile, or set eps manually)', cls)
 
         if n_clusters > 3 and n_clustered < 300:
             _add('over_cluster_small', 'warning', 'Over-clustering on small class',
@@ -638,7 +638,7 @@ def _generate_insights_page(cluster_df, stats, story, heading_style, normal_styl
 def build_pdf(temp_txt_file, clustering_dir, pdf_name, pdf_quality,
               imgs_path=None, label_path=None, classes_txt=None,
               auto_tune=False, auto_tune_percentile=95, epsilon=0.15,
-              contrastive_groups=None):
+              contrastive_groups=None, eps_method="knee"):
     """Build the complete PDF report."""
     print("\n" + "="*70)
     print("PDF REPORT GENERATION")
@@ -777,8 +777,11 @@ def build_pdf(temp_txt_file, clustering_dir, pdf_name, pdf_quality,
     # --- Section: Pipeline Configuration ---
     story.append(Paragraph("PIPELINE CONFIGURATION", heading_style))
 
-    if auto_tune:
-        eps_config_label = "Auto-Tune k-NN Percentile"
+    if auto_tune and eps_method == "knee":
+        eps_config_label = "Auto-Tune Eps Rule"
+        eps_config_value = "knee of sorted k-distance curve"
+    elif auto_tune:
+        eps_config_label = "Auto-Tune k-NN Percentile (caps outliers near 100-p%)"
         eps_config_value = str(auto_tune_percentile)
     else:
         eps_config_label = "DBSCAN Epsilon (manual)"
@@ -1056,6 +1059,7 @@ def main():
     parser.add_argument("--classes_txt", default=None)
     parser.add_argument("--auto_tune", action="store_true")
     parser.add_argument("--auto_tune_percentile", type=int, default=95)
+    parser.add_argument("--eps_method", choices=["knee", "percentile"], default="knee")
     parser.add_argument("--epsilon", type=float, default=0.15)
     parser.add_argument("--pdf_quality", type=int, default=75,
                         help="JPEG compression quality for images in PDF (1-95, default 75)")
@@ -1082,6 +1086,7 @@ def main():
         classes_txt=args.classes_txt,
         auto_tune=args.auto_tune,
         auto_tune_percentile=args.auto_tune_percentile,
+        eps_method=args.eps_method,
         epsilon=args.epsilon,
         contrastive_groups=contrastive_groups,
     )

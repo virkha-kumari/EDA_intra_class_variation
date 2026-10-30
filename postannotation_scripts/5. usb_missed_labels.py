@@ -7,11 +7,15 @@ detector. Relies on a fixed-camera dataset (CCTV): a class recurs in the same im
 Per requested class:
  1. Collect every GT bbox of the class (normalized YOLO coords) across all splits.
  2. Greedy-dedup boxes at IoU < --region_iou  ->  seen_<cls>_regions.
- 3. Pad each region by --pad (fraction of image W/H per side).
- 4. Crop each region from EVERY image in the dataset. A candidate is skipped when it
-    overlaps (IoU >= --region_iou) a GT box of the same class in that same image.
- 5. Embed candidates with Script 2's DINOv2 function (identical pooling to the reference
-    embeddings) — crops are written to a temp folder, embedded, then deleted.
+ 3. Crop each region from EVERY image in the dataset with Script 1's exact crop rule
+    (same pixel conversion, no padding, JPEG 95) so candidates match the reference crops.
+ 4. A candidate is skipped when a GT box of the same class in that image overlaps it:
+    IoU >= --region_iou, or intersection / smaller-box area >= --suppress_overlap.
+    (Kept regions may overlap each other up to IoU < --region_iou, so IoU alone would let a
+    labelled object re-appear through a neighbouring region.)
+ 5. Embed candidates with Script 2's DINOv2 function (identical preprocessing + pooling to the
+    reference embeddings) — crops are written to a temp folder, embedded, then deleted.
+    Cached reference embeddings must carry Script 2's current preprocessing tag.
  6. Reference pool from Script 2's cached <cls>/embeddings_dinov2.npy, re-clustered in-process
     with Script 3's DBSCAN (no montages): all noise points + per cluster: centroid
     + --n_farthest points by cosine distance from that centroid.
@@ -73,6 +77,15 @@ def _iou(a, b):
     area_a = (a[2] - a[0]) * (a[3] - a[1])
     area_b = (b[2] - b[0]) * (b[3] - b[1])
     return inter / (area_a + area_b - inter)
+
+
+def _containment(a, b):
+    """Intersection / smaller-box area of two (x1, y1, x2, y2) boxes."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    smaller = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return inter / smaller if smaller > 0 else 0.0
 
 
 def _yolo_to_xyxy_norm(cx, cy, w, h):
@@ -141,12 +154,14 @@ def main():
                    help="Cosine sim threshold per class (same order as --usb_classes)")
     p.add_argument("--n_farthest", type=int, default=4, help="Farthest points per cluster added to reference pool")
     p.add_argument("--region_iou", type=float, default=0.8, help="IoU for region dedup AND GT suppression")
-    p.add_argument("--pad", type=float, default=0.02, help="Region padding, fraction of image W/H per side")
+    p.add_argument("--suppress_overlap", type=float, default=0.5,
+                   help="Also suppress a region when a same-class GT box covers this fraction of the smaller box")
     p.add_argument("--save_suffix", type=str, default="embeddings_dinov2.npy")
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--min_samples", type=int, default=3)
     p.add_argument("--auto_tune", action="store_true")
     p.add_argument("--auto_tune_percentile", type=int, default=90)
+    p.add_argument("--eps_method", choices=["knee", "percentile"], default="knee")
     p.add_argument("--eps", type=float, default=0.15)
     args = p.parse_args()
 
@@ -160,6 +175,7 @@ def main():
     if unknown:
         raise ValueError(f"Classes not in classes.txt: {unknown}")
 
+    crop_mod = _load_module("1. ann_txt_files_crop_bbox.py", "usb_crop")
     embed_mod = _load_module("2. save_dinov2_embeddings_per_class.py", "usb_embed")
     cluster_mod = _load_module("3. clustering_of_classes_embeddings.py", "usb_cluster")
 
@@ -186,6 +202,10 @@ def main():
         if not emb_path.exists():
             print(f"  ⚠️  No embeddings at {emb_path} — skipping class")
             continue
+        if embed_mod.cached_tag(emb_path) != embed_mod.PREPROC_TAG:
+            print(f"  ⚠️  {emb_path.name} was made with different/unknown DINOv2 preprocessing — "
+                  f"re-run Script 2 first (refs and candidates must share preprocessing). Skipping class")
+            continue
 
         # --- GT boxes per image (needed for both region collection and suppression) ---
         gt_per_image = {img_path: _read_gt_boxes(txt_path, cls_id) for _, img_path, txt_path in index}
@@ -199,7 +219,8 @@ def main():
 
         # --- Reference pool from cached embeddings (no montages, no re-embedding) ---
         ref_emb = np.load(str(emb_path))
-        eps = cluster_mod.auto_tune_eps(ref_emb, args.min_samples, args.auto_tune_percentile) if args.auto_tune else args.eps
+        eps = (cluster_mod.auto_tune_eps(ref_emb, args.min_samples, args.auto_tune_percentile, method=args.eps_method)
+               if args.auto_tune else args.eps)
         labels, _, _ = cluster_mod.cluster_single_class(ref_emb, cls_name, eps, args.min_samples)
         pool = build_reference_pool(ref_emb, labels, args.n_farthest)
         print(f"  Reference pool: {len(pool)} embeddings (from {len(ref_emb)} crops)")
@@ -213,7 +234,9 @@ def main():
 
         for split, img_path, _ in tqdm(index, desc=f"  Cropping regions [{cls_name}]", unit="img"):
             gt_boxes = gt_per_image[img_path]
-            todo = [r for r in regions if all(_iou(r, g) < args.region_iou for g in gt_boxes)]
+            todo = [r for r in regions
+                    if all(_iou(r, g) < args.region_iou and _containment(r, g) < args.suppress_overlap
+                           for g in gt_boxes)]
             if not todo:
                 continue
             img = cv2.imread(img_path)
@@ -223,8 +246,9 @@ def main():
             base = os.path.splitext(os.path.basename(img_path))[0]
             prefix = f"{split}_" if split else ""
             for ridx, (x1, y1, x2, y2) in enumerate(todo):
-                px1 = max(0, int((x1 - args.pad) * W)); py1 = max(0, int((y1 - args.pad) * H))
-                px2 = min(W, int((x2 + args.pad) * W)); py2 = min(H, int((y2 + args.pad) * H))
+                # Script 1's crop rule (same int conversion + clipping) — candidates match the refs
+                px1, py1, px2, py2 = crop_mod.yolo_to_bbox((x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1, W, H)
+                px1, py1, px2, py2 = max(0, px1), max(0, py1), min(W, px2), min(H, py2)
                 crop = img[py1:py2, px1:px2]
                 if crop.size == 0 or min(crop.shape[:2]) < 3:
                     continue

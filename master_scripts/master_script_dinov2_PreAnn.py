@@ -44,6 +44,8 @@ Tuning Guide:
 """
 
 import argparse
+import hashlib
+import json
 import logging
 from pathlib import Path
 import sys
@@ -212,11 +214,33 @@ def extract_pose_features(keypoints_norm):
     return np.array(features, dtype=np.float32)
 
 
-def compute_multiview_embeddings(frame_data, processor, model, device, batch_size, cache_dir=None, scene_weight=0.9, pose_weight=0.1):
+# Whole frame → 224x224 (no center crop). The processor default (short edge 256 → center-crop 224)
+# drops the frame borders. Bump PREANN_PREPROC_TAG whenever preprocessing/pooling changes.
+DINO_PREPROC = {"do_center_crop": False, "size": {"height": 224, "width": 224}}
+PREANN_PREPROC_TAG = "facebook/dinov2-base|square224-nocrop|cls+patchmean|pose20"
+
+
+def _frames_fingerprint(frame_data):
+    """Hash of frame paths + sizes + mtimes + preprocessing tag — cache is valid only for the same frames."""
+    h = hashlib.sha1(PREANN_PREPROC_TAG.encode())
+    for f in frame_data:
+        p = Path(f['path'])
+        try:
+            st = p.stat()
+            h.update(f"{p}|{st.st_size}|{int(st.st_mtime)}".encode())
+        except OSError:
+            h.update(f"{p}|missing".encode())
+    return h.hexdigest()
+
+
+def compute_multiview_embeddings(frame_data, processor, model, device, batch_size, cache_dir=None):
     """
-    Compute embeddings with optional pose integration:
-    - If person detected: scene + lightweight pose features (weighted)
-    - If no person: 100% scene + zero-padded pose/skeleton features (for consistent dimensions)
+    Compute unweighted embeddings with optional pose integration:
+    - If person detected: scene [CLS||patch-mean] (1536) + 20 pose features
+    - If no person: scene + zero pose features (for consistent dimensions)
+    Scene/pose weights are applied later, per block, in cluster_activities_with_pca_hdbscan()
+    (weighting here would be undone by standardisation/whitening).
+    Returns (embeddings, valid_frame_indices) — indices into frame_data of frames that loaded.
     """
     # Determine embedding mode FIRST (before checking cache)
     frames_with_persons = sum(1 for f in frame_data if f['has_persons'])
@@ -227,28 +251,30 @@ def compute_multiview_embeddings(frame_data, processor, model, device, batch_siz
     use_scene_only = frames_with_persons < min_persons_for_pose
     expected_dim = 1536 if use_scene_only else 1536 + 20  # Scene-only: 1536, Scene+pose: 1556
 
-    # Check cache with dimension validation
+    # Check cache: same frames (paths/sizes/mtimes), same preprocessing, same dimension
+    fingerprint = _frames_fingerprint(frame_data)
     if cache_dir is not None:
         cache_file = cache_dir / "temp_multiview_emb.npy"
         cache_indices_file = cache_dir / "temp_multiview_emb_indices.npy"
+        cache_meta_file = cache_dir / "temp_multiview_emb_meta.json"
 
-        if cache_file.exists() and cache_indices_file.exists():
+        if cache_file.exists() and cache_indices_file.exists() and cache_meta_file.exists():
             embeddings = np.load(cache_file)
             valid_frame_indices = np.load(cache_indices_file)
+            try:
+                cached_fp = json.loads(cache_meta_file.read_text(encoding="utf-8")).get("fingerprint")
+            except ValueError:
+                cached_fp = None
 
-            # Validate cache dimension matches current mode
-            if embeddings.shape[1] == expected_dim:
+            if (cached_fp == fingerprint and embeddings.shape[1] == expected_dim
+                    and len(embeddings) == len(valid_frame_indices)):
                 print(f"\n✅ Found cached embeddings: {cache_file}")
-                print("   Loading from cache (delete cache files to recompute)...")
-                print(f"   Loaded {len(embeddings)} embeddings from cache")
+                print(f"   Loaded {len(embeddings)} embeddings from cache (same frames + preprocessing)")
                 return embeddings, valid_frame_indices.tolist()
-            else:
-                print(f"\n⚠️  Cached embeddings dimension mismatch:")
-                print(f"   Cached: {embeddings.shape[1]}-dim, Expected: {expected_dim}-dim")
-                print(f"   Recomputing embeddings in {'scene-only' if use_scene_only else 'scene+pose'} mode...")
+            print(f"\n⚠️  Cached embeddings don't match these frames/preprocessing/mode — recomputing")
 
-    # Process ALL frames, not just those with persons
-    valid_frame_indices = list(range(len(frame_data)))
+    # Indices (into frame_data) of frames that actually load — embeddings stay aligned with them
+    valid_frame_indices = []
 
     if use_scene_only:
         print(f"\n⚠️  Only {frames_with_persons} frames with persons detected (minimum {min_persons_for_pose} needed)")
@@ -301,14 +327,16 @@ def compute_multiview_embeddings(frame_data, processor, model, device, batch_siz
             valid_indices_in_batch = []
             for idx, pil_img in enumerate(batch_images_pil):
                 if pil_img is not None:
-                    scene_img = pil_img.resize((224, 224), PILImage.Resampling.LANCZOS)
-                    batch_scene_imgs.append(scene_img)
+                    batch_scene_imgs.append(pil_img)
                     valid_indices_in_batch.append(idx)
+                    valid_frame_indices.append(batch_start + idx)
+                else:
+                    print(f"\n⚠️  Unreadable frame skipped: {batch_frames[idx]['path']}")
 
             # Compute scene embeddings (all frames)
             scene_embs = None
             if len(batch_scene_imgs) > 0:
-                inputs_scene = processor(images=batch_scene_imgs, return_tensors="pt")
+                inputs_scene = processor(images=batch_scene_imgs, return_tensors="pt", **DINO_PREPROC)
                 inputs_scene = {k: v.to(device) for k, v in inputs_scene.items()}
 
                 if device == "cuda":
@@ -349,13 +377,10 @@ def compute_multiview_embeddings(frame_data, processor, model, device, batch_siz
                     # Scene-only mode: just use DINOv2 scene embeddings (1536-dim)
                     multiview_embeddings.append(scene_emb)
                 elif batch_has_persons[batch_idx] and valid_idx in frame_pose_features_aggregates:
-                    # Frame with person: scene (90%) + lightweight pose features (10%)
-                    pose_features_agg = frame_pose_features_aggregates[valid_idx]
-
-                    # Pre-allocate output array to avoid temporary allocations
+                    # Frame with person: scene + pose features (unweighted — weights applied at clustering)
                     combined_emb = np.empty(1536 + pose_features_dim, dtype=np.float32)
-                    combined_emb[:1536] = scene_emb * scene_weight      # Scene dominant
-                    combined_emb[1536:] = pose_features_agg * pose_weight  # Lightweight pose supplement
+                    combined_emb[:1536] = scene_emb
+                    combined_emb[1536:] = frame_pose_features_aggregates[valid_idx]
                     multiview_embeddings.append(combined_emb)
                 else:
                     # Frame without person: scene only + zero-padded pose features
@@ -385,6 +410,8 @@ def compute_multiview_embeddings(frame_data, processor, model, device, batch_siz
         print(f"\n💾 Saving embeddings to cache: {cache_file}")
         np.save(cache_file, multiview_embeddings)
         np.save(cache_indices_file, np.array(valid_frame_indices))
+        (cache_dir / "temp_multiview_emb_meta.json").write_text(
+            json.dumps({"fingerprint": fingerprint, "preproc": PREANN_PREPROC_TAG}), encoding="utf-8")
         print(f"   ✅ Cache saved ({len(multiview_embeddings)} embeddings)")
 
     return multiview_embeddings, valid_frame_indices
@@ -461,17 +488,20 @@ def categorize_lighting(brightness_values):
     return lighting_labels
 
 
-def cluster_activities_with_pca_hdbscan(embeddings, n_pca_components, min_cluster_size, min_samples, cluster_selection_epsilon=0.0):
+def cluster_activities_with_pca_hdbscan(embeddings, n_pca_components, min_cluster_size, min_samples,
+                                        cluster_selection_epsilon=0.0, scene_dim=1536,
+                                        scene_weight=0.7, pose_weight=0.3):
     """
-    Cluster frames by activity using PCA whitening + HDBSCAN.
+    Cluster frames by activity using per-block PCA whitening + HDBSCAN.
     Pipeline:
     1. Check minimum samples
-    2. Standardize features (zero mean, unit variance)
-    3. PCA whiten to n_pca_components dims (decorrelates axes, equalizes dimension importance)
-    4. L2-normalize (maps to unit hypersphere for Euclidean ≈ cosine distance)
-    5. HDBSCAN 'eom' clustering (merges sub-clusters into meaningful groups, reduces fragmentation)
-       cluster_selection_epsilon: post-hoc merge step — absorbs outliers near existing clusters
-       without loosening the core density requirement (0.0=off, 0.3=moderate merging)
+    2. Scene block (first scene_dim dims): standardize → PCA whiten to n_pca_components dims
+    3. Pose block (remaining dims, if any): standardize
+    4. Scale each block so its share of total variance = its weight (scene_weight / pose_weight).
+       Weights are applied AFTER standardization/whitening — applying them before would be undone.
+    5. L2-normalize (maps to unit hypersphere for Euclidean ≈ cosine distance)
+    6. HDBSCAN 'eom' clustering (merges sub-clusters into meaningful groups, reduces fragmentation)
+       cluster_selection_epsilon: clusters closer than this distance are merged (0.0=off)
     """
     min_samples_required = 3
     if embeddings.shape[0] < min_samples_required:
@@ -480,18 +510,26 @@ def cluster_activities_with_pca_hdbscan(embeddings, n_pca_components, min_cluste
         print(f"      Skipping clustering - all frames assigned to single group")
         return np.zeros(embeddings.shape[0], dtype=int), embeddings, {"insufficient_samples": True}
 
-    # 1. Standardize
-    scaler = StandardScaler()
-    embeddings_scaled = scaler.fit_transform(embeddings)
-
-    # 2. PCA whitening (decorrelates + equalizes all dimensions)
-    actual_components = min(n_pca_components, embeddings_scaled.shape[0] - 1, embeddings_scaled.shape[1])
+    # 1-2. Scene block: standardize + PCA whitening (decorrelates + equalizes scene dimensions)
+    scene_scaled = StandardScaler().fit_transform(embeddings[:, :scene_dim])
+    actual_components = min(n_pca_components, scene_scaled.shape[0] - 1, scene_scaled.shape[1])
     pca = PCA(n_components=actual_components, whiten=True, random_state=42)
-    pca_embeddings = pca.fit_transform(embeddings_scaled)
+    scene_pcs = pca.fit_transform(scene_scaled)
     explained = pca.explained_variance_ratio_.sum() * 100
 
-    print(f"  PCA: Reduced {embeddings.shape[1]} dims → {actual_components} dims")
-    print(f"       (whitened, explains {explained:.1f}% of variance)")
+    print(f"  PCA: scene {scene_dim} dims → {actual_components} dims")
+    print(f"       (whitened, explains {explained:.1f}% of scene variance)")
+
+    # 3-4. Weight blocks by share of total variance (whitened PCs have unit variance each)
+    blocks = [scene_pcs * np.sqrt(scene_weight / actual_components)]
+    pose = embeddings[:, scene_dim:]
+    if pose.shape[1] > 0 and pose_weight > 0:
+        pose_scaled = StandardScaler().fit_transform(pose)
+        pose_var = float(pose_scaled.var(axis=0).sum())  # constant columns stay 0
+        if pose_var > 0:
+            blocks.append(pose_scaled * np.sqrt(pose_weight / pose_var))
+            print(f"  Blocks: scene weight {scene_weight}, pose weight {pose_weight} (share of total variance)")
+    pca_embeddings = np.hstack(blocks)
 
     # 3. L2 normalize (Euclidean distance on unit hypersphere ≈ cosine distance)
     norms = np.linalg.norm(pca_embeddings, axis=1, keepdims=True)
@@ -652,7 +690,7 @@ def create_quality_chart(metrics, output_path, anisotropy_threshold):
     all_blur_counts = [blurry_count, sharp_count]
     all_blur_colors = ['#f44336', '#4caf50']
     all_blur_labels = [f'Blurry (motion)\n{blurry_count} frames',
-                       f'Sharp\n{sharp_count} frames']
+                       f'No motion blur\n{sharp_count} frames']
 
     filtered_blur_counts = [c for c in all_blur_counts if c > 0]
     filtered_blur_colors = [all_blur_colors[i] for i, c in enumerate(all_blur_counts) if c > 0]
@@ -1037,7 +1075,7 @@ def main():
         pdf_name = args.pdf_name if args.pdf_name else f"PreAnnotation_Quality_Report_{_frames_folder_name}.pdf"
 
         # Non-interactive: delete cache files so stale embeddings are never reused
-        for _cache in ["temp_multiview_emb.npy", "temp_multiview_emb_indices.npy"]:
+        for _cache in ["temp_multiview_emb.npy", "temp_multiview_emb_indices.npy", "temp_multiview_emb_meta.json"]:
             _p = os.path.join(RESULTS_DIR, _cache)
             if os.path.isfile(_p):
                 os.remove(_p)
@@ -1126,7 +1164,7 @@ def main():
     print("STEP 3: COMPUTE DINOv2 EMBEDDINGS ([CLS||avg_patches], 1536d)")
     print("="*60)
     cache_dir = output_dir if use_embedding_cache else None
-    embeddings, valid_frame_indices = compute_multiview_embeddings(frame_data, processor, model, device, batch_size, cache_dir=cache_dir, scene_weight=scene_weight, pose_weight=pose_weight)
+    embeddings, valid_frame_indices = compute_multiview_embeddings(frame_data, processor, model, device, batch_size, cache_dir=cache_dir)
 
     if len(embeddings) == 0:
         logger.error("No valid embeddings computed — all frames may be corrupted")
@@ -1160,7 +1198,9 @@ def main():
     print("\n" + "="*60)
     print("STEP 5: PCA WHITENING + HDBSCAN CLUSTERING")
     print("="*60)
-    activity_labels, pca_embeddings, cluster_quality = cluster_activities_with_pca_hdbscan(embeddings, n_pca_components=n_components, min_cluster_size=min_cluster_size, min_samples=min_samples, cluster_selection_epsilon=cluster_selection_epsilon)
+    activity_labels, pca_embeddings, cluster_quality = cluster_activities_with_pca_hdbscan(
+        embeddings, n_pca_components=n_components, min_cluster_size=min_cluster_size, min_samples=min_samples,
+        cluster_selection_epsilon=cluster_selection_epsilon, scene_weight=scene_weight, pose_weight=pose_weight)
 
     # Count activities (excluding noise)
     unique_activities = np.unique(activity_labels)
@@ -1231,7 +1271,7 @@ def main():
         median_anisotropy = np.median(quality_metrics['anisotropy'])
 
         # Anisotropy score (lower is better - inverted)
-        anisotropy_score = max(0, 10 - (median_anisotropy / 5) * 10)  # Lower anisotropy = sharper
+        anisotropy_score = max(0, 10 - (median_anisotropy / 5) * 10)  # Lower anisotropy = less motion blur
         brightness_score = 10 - abs(median_brightness - 127) / 127 * 10
         contrast_score = min(10, median_contrast / 50 * 10)
 

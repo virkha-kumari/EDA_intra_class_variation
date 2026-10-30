@@ -22,7 +22,7 @@ Guidance for Claude Code (claude.ai/code) when working with code in this reposit
 |--------|---------|-------------|
 | `master_scripts/master_script_dinov2_PreAnn.py` | **Pre-annotation**: Frame quality assessment with PDF report (uses DINOv2 + PaCMAP) | BEFORE annotation |
 | `master_scripts/master_script_dinov2_PostAnn_PreTrain.py` | Automated pre-training pipeline (uses DINOv2) | AFTER annotation |
-| `master_scripts/master_script_dinov2_PostTrain.py` | Automated post-training pipeline (uses DINOv2) | AFTER model training |
+| `master_scripts/master_script_dinov2_PostTrain.py` | ⚠️ DEPRECATED, not maintained — post-training pipeline, reference only | — |
 | `postannotation_scripts/1. ann_txt_files_crop_bbox.py` | Pre-training: Extract crops from YOLO annotations | Part of pretrain pipeline |
 | `postannotation_scripts/1. yolo_model_crop_bbox_per_class.py` | Post-training: Extract crops from model detections | Part of posttrain pipeline |
 | `postannotation_scripts/2. save_dinov2_embeddings_per_class.py` | Generate DINOv2 embeddings | Part of both pipelines |
@@ -104,8 +104,8 @@ Input: Raw frames (.png, .jpg, .jpeg)
 [master_scripts/master_script_dinov2_PreAnn.py]
     - Person detection (YOLOv11-pose)
     - DINOv2 [CLS||avg_patches] embeddings (1536d, adaptive: scene weight + pose weight when persons detected)
-    - PCA whitening → PaCMAP dimensionality reduction + HDBSCAN clustering
-    - Quality metrics (brightness, sharpness, contrast, anisotropy)
+    - Per-block PCA whitening + weights → HDBSCAN clustering (PaCMAP = 2-D plot only)
+    - Quality metrics (brightness, contrast, motion blur via gradient anisotropy)
     - Lighting categorization
     - Visual montages per activity
     |
@@ -127,7 +127,7 @@ Each master script defines its own `RESULTS_DIR` (`postann_pretrain_results/` fo
 Input (annotated images OR video+model)
     |
     v
-[Script 1] Crop bounding boxes per class --> <results>/cropped_imgs_by_class/<class>/*.png
+[Script 1] Crop bounding boxes per class --> <results>/cropped_imgs_by_class/<class>/*.jpg
                                              <results>/temp_ann_file.txt (statistics, pre-training only)
     |
     v
@@ -136,19 +136,19 @@ Input (annotated images OR video+model)
     |
     v
 [Script 3] DBSCAN clustering --> <results>/clustering_results/<class>_clusters.png
-                                 <results>/clustering_results/<class>_montage.png
+                                 <results>/clustering_results/<class>_montage.jpg
                                  <results>/clustering_results/<class>_samples/cluster_N/
                                  <results>/clustering_results/cluster_statistics.csv
     |
     v (optional)
-[Script 4] PDF report generator --> <results>/clustering_results/output.pdf (combines Script 1 + 3 results)
+[Script 4] PDF report generator --> <results>/clustering_results/PDF_REPORT_<name>.pdf (combines Script 1 + 3 results)
 [Script 5] USB missed labels --> <results>/clustering_results/missing_labels/<class>/<image>.jpg
 [Interactive viewer] --> <results>/clustering_results/<class>_interactive.html
 ```
 
 ### Key Data Structures
 - **Embeddings**:
-  - Pre-annotation: 1536-dimensional vectors from `facebook/dinov2-base` (CLS + avg_patches concatenated), with PCA whitening before PaCMAP
+  - Pre-annotation: 1536-dimensional vectors from `facebook/dinov2-base` (CLS + avg_patches concatenated), with PCA whitening before HDBSCAN (PaCMAP only for the 2-D plot)
   - Pre/Post-training: 768-dimensional vectors from `facebook/dinov2-base`
 - **Image mapping**: `embeddings_dinov2_image_list.txt` maintains alignment between embeddings and source images
 - **YOLO format**: `class_id x_center y_center width height` (normalized coordinates)
@@ -193,8 +193,9 @@ All parameters configured via interactive prompts. Clustering params always aske
 ### Clustering (Script 3)
 - `--eps`: DBSCAN epsilon (0.1 strict, 0.15 balanced, 0.2-0.3 lenient)
 - `--min_samples`: Minimum points to form cluster (2-3 typical)
-- `--auto_tune`: Recommended - uses k-NN distance percentile per class
-- `--auto_tune_percentile`: k-NN percentile for auto-tune (default: 90; 90=tight, 95=balanced, 98=loose)
+- `--auto_tune`: Recommended - eps per class from the k-distance curve
+- `--eps_method`: `knee` (default, data-driven outlier rate) or `percentile` (outlier rate capped near 100-p% by construction)
+- `--auto_tune_percentile`: only with `--eps_method percentile` (default: 90)
 - `--umap_min_dist`: UMAP min_dist parameter (default: 0.05; 0.0=tight, 0.1=loose)
 - `--save_suffix`: Embedding filename to load (default: `embeddings_dinov2.npy`, must match Script 2 output)
 - `--max_samples`: Sample images per cluster (default: 5, outliers all saved) — master script overrides to 20
@@ -207,7 +208,7 @@ All parameters configured via interactive prompts. Clustering params always aske
 - `--usb_classes` / `--sim_thresholds`: class names + one cosine-sim threshold each (default 0.8; master prompts per class)
 - `--n_farthest`: farthest-from-centroid points per cluster added to reference pool (default 4)
 - `--region_iou`: IoU for BOTH region dedup and same-image GT suppression (default 0.8)
-- `--pad`: region padding as fraction of image W/H per side (default 0.02)
+- `--suppress_overlap`: also suppress a region when a same-class GT box covers this fraction of the smaller box (default 0.5)
 - Master script args: `--usb_classes`, `--usb_sim_thresholds` (single value broadcasts to all classes), `--usb_n_farthest`, `--usb_only`
 
 ### Video Processing (Script 1 post-training)
@@ -219,7 +220,7 @@ All parameters configured via interactive prompts. Clustering params always aske
 
 ### Pre-Annotation Script
 1. **Embedding Model**: Uses DINOv2 (`facebook/dinov2-base`) with CLS token + avg_patches concatenated = 1536d
-2. **Activity Clustering**: PCA whitening → PaCMAP (dimensionality reduction) → HDBSCAN (density-based clustering)
+2. **Activity Clustering**: scene block standardize → PCA whiten, pose block standardize, blocks weighted by variance share → L2 → HDBSCAN. PaCMAP is visualisation only.
 3. **Adaptive Embeddings**:
    - Frames WITH persons: scene (1536d) + pose features, weighted and concatenated
    - Frames WITHOUT persons: scene embeddings (1536d) + zero-padded pose features
@@ -235,7 +236,7 @@ All parameters configured via interactive prompts. Clustering params always aske
 2. **Sorted Order**: Both scripts use `sorted()` on file paths to maintain consistent ordering
 3. **CSV Saving**: Script 3 has CSV saving enabled (not commented out)
 4. **Outlier Sampling**: Script 3 saves ALL outlier images (not sampled), while regular clusters sampled up to `--max_samples`
-5. **Montage rendering**: Script 3 uses matplotlib for montages (layout: `n_cols × n_rows` grid at 200 DPI). Images pre-decoded and resized via PIL before passing to `imshow` for speed. Layout and visual output identical to original.
+5. **Montage rendering**: Script 3 uses matplotlib for montages (layout: `n_cols × n_rows` grid). Images pre-decoded and resized via PIL before passing to `imshow` for speed. Layout and visual output identical to original.
 6. **PDF Image Splitting**: Script 4 splits tall montages at cluster row boundaries (never mid-cluster) by reading `cluster_statistics.csv` to determine row count
 7. **PDF Image Compression**: Script 4 converts all PNG montages to JPEG quality 75 for ~80% file size reduction (configurable via `--pdf_quality`)
 8. **PIL Decompression Bomb**: Script 4 disables PIL's `MAX_IMAGE_PIXELS` limit to handle large montages (25+ clusters)
@@ -247,7 +248,7 @@ All parameters configured via interactive prompts. Clustering params always aske
 14. **PDF Insights & Recommendations page**: Script 4 appends final page after montages — **issue-centric layout** grouped by severity (🔴 Critical → 🟡 Warning → 🟢 OK → ℹ Info). Each row = one unique issue type; "Classes Affected" column lists all classes that triggered it. Max ~1 page regardless of class count. 13 rules evaluated: outlier rate, cluster count, all-noise, tight-core+noise, insufficient data, low sample count, systematic noise, eps spread, over-fragmentation, over-clustering on small class, homogeneous OK, zero outliers, large class downsampled. No class-imbalance row. `n_samples` parsed as both plain int and `"clustered/total"` string.
 15. **Duplicate image basename detection**: Script 1 detects per-split basenames with multiple image formats (e.g. `foo.png` + `foo.jpg` in same folder). Count written to temp txt under `DUPLICATE IMAGE BASENAMES` section. Script 4 parses it and shows row in Dataset Overview table + file detail in Annotation Issue Files block.
 16. **USB (Script 5) reuses Script 2/3 code, not their on-disk output**: Script 3 never persists per-sample cluster labels (only class-level `cluster_statistics.csv`), and for "uniform" downsampled classes its in-memory labels aren't even row-aligned with the full `.npy`. So USB re-runs DBSCAN in-process on Script 2's cached embeddings (cheap — pure array math, no GPU, no image I/O) and must NOT call Script 3's `save_cluster_samples`/`create_cluster_montage` (montage saving is the slow part on 50K+ sample classes; clustering itself is fast).
-17. **USB region assumption**: `seen_<cls>_regions` are fixed pixel locations reused across every image — valid only for fixed-camera (CCTV) datasets. Padding is 2% of **image** W/H per side (deliberately NOT box-relative, which is the convention in the sibling `Auto_Ann_work` repo).
+17. **USB region assumption**: `seen_<cls>_regions` are fixed pixel locations reused across every image — valid only for fixed-camera (CCTV) datasets. Candidates are cropped with Script 1's exact crop rule (no padding) so they match the reference crops; regions are suppressed by IoU >= region_iou OR containment >= suppress_overlap with same-class GT.
 18. **USB target walk is unavoidable**: no script persists a full dataset image/label manifest (Script 1 holds per-split filename sets in memory, writes only capped/aggregate counts to `temp_ann_file.txt`), so USB does its own `_detect_splits` + `os.listdir` walk. Deliberate decision — not worth a Script 1 change.
 19. **USB-only mode**: master script Step 0 asks run mode (Full EDA / Full EDA + USB / USB only). USB-only crops+embeds ONLY the selected classes (`class_ids` filtered), skips Step 3 clustering and PDF entirely. Headless equivalent: `--usb_only` (requires `--usb_classes`). Clustering params (`auto_tune`, `epsilon`, `min_pts`, `auto_tune_percentile`) are still prompted/passed in USB-only mode because USB's own reference-pool DBSCAN uses them.
 
@@ -265,7 +266,7 @@ All parameters configured via interactive prompts. Clustering params always aske
 - Script 2 outputs: `{save_suffix}.npy` + `{save_suffix_without_.npy}_image_list.txt`
   - Default: `embeddings_dinov2.npy` + `embeddings_dinov2_image_list.txt`
   - Custom: `custom_emb.npy` + `custom_emb_image_list.txt`
-- Script 3 outputs: `{class}_clusters.png` (if `--save_class_scatter`), `{class}_montage.png` (if `--save_montage`), `cluster_statistics.csv`, `centroid_overview_N.png`
+- Script 3 outputs: `{class}_clusters.png` (if `--save_class_scatter`), `{class}_montage.jpg` (if `--save_montage`), `cluster_statistics.csv`, `centroid_overview_N.png`
 - Script 4 outputs: `{pdf_name}.pdf` + `temp_pdf_charts/` directory with temp JPEG chunks (auto-cleaned)
 - Script 5 (USB) outputs: `missing_labels/<class>/{split_}{image_name}.jpg` (full frame, flagged regions red + sim score, existing GT boxes green) inside the clustering results dir. Candidate crops staged in `missing_labels/_temp_crops/<class>/` and deleted after embedding.
 
@@ -282,7 +283,7 @@ Always prompted with derived default shown — user can accept or override.
 - ultralytics (YOLOv8/YOLOv11)
 - transformers (DINOv2 for all pipelines)
 - scikit-learn (DBSCAN, PCA)
-- pacmap (pre-annotation PaCMAP dimensionality reduction)
+- pacmap (pre-annotation 2-D visualisation)
 - hdbscan (pre-annotation clustering)
 - opencv-python, pillow, numpy, pandas, matplotlib, seaborn, psutil, tqdm
 - reportlab (for PDF generation in Script 4)
@@ -332,3 +333,10 @@ Always prompted with derived default shown — user can accept or override.
 - Utility modules: `<project_root>/utils/` (e.g., `preann_pdf_generate.py`)
 - README: `<project_root>/README.md`
 - Docs (writeups, ablations, changelog): `<project_root>/docs/` (`changes.md`, `plans.md`, `embedding-ablation.md`, `usb-missed-labels-ablation.md`)
+
+## DINOv2 preprocessing + cache invariants
+
+- All scoring embeddings (Script 2, USB, PreAnn) resize the whole crop/frame to 224x224 with **no center crop** (`DINO_PREPROC`). The processor default (short edge 256 → center-crop 224) drops box ends / frame borders.
+- Script 2 writes `<suffix>_meta.json` with `PREPROC_TAG`; `--use_cache`, USB, and the master "reuse" prompt only accept embeddings with the current tag. Bump the tag whenever preprocessing or pooling changes.
+- PreAnn cache is keyed by a fingerprint (frame paths + sizes + mtimes + preprocessing tag), not by dimension.
+- PreAnn scene/pose weights are applied per block after standardization/whitening (share of total variance), not before.

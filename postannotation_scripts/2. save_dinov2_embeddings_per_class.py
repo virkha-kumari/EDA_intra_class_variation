@@ -11,14 +11,18 @@ Walks a root folder of cropped images organized like:
 For each class it:
  - loads images in batches
  - encodes them with facebook/dinov2-base
+ - resizes each crop to 224x224 with NO center crop (the whole box reaches the model —
+   the processor default resizes short edge to 256 then center-crops, cutting box ends)
  - computes a 768-d vector per image (mean pooling of last_hidden_state)
  - saves embeddings to: cropped_images/<class_name>/embeddings_dinov2.npy
+   + embeddings_dinov2_meta.json (preprocessing tag; --use_cache only reuses a matching tag)
 
 Usage:
     python save_dinov2_embeddings_per_class.py --root ./cropped_imgs_by_class --batch 32
 """
 
 import argparse
+import json
 from pathlib import Path
 from PIL import Image, UnidentifiedImageError
 from transformers import AutoImageProcessor, AutoModel
@@ -28,6 +32,24 @@ from tqdm import tqdm
 import sys
 import gc
 import torch.cuda
+
+# Whole crop → 224x224 (no center crop). Change PREPROC_TAG whenever preprocessing/pooling changes,
+# so cached .npy files from older settings are never mixed with fresh ones (Script 5 checks it too).
+DINO_PREPROC = {"do_center_crop": False, "size": {"height": 224, "width": 224}}
+PREPROC_TAG = "facebook/dinov2-base|square224-nocrop|mean-all-tokens"
+
+
+def meta_path_for(emb_path: Path) -> Path:
+    return emb_path.with_name(emb_path.stem + "_meta.json")
+
+
+def cached_tag(emb_path: Path):
+    """Preprocessing tag stored next to an embeddings file, or None if missing/unreadable."""
+    try:
+        return json.loads(meta_path_for(emb_path).read_text(encoding="utf-8")).get("preproc")
+    except (OSError, ValueError):
+        return None
+
 
 def find_class_folders(root: Path):
     return [p for p in sorted(root.iterdir()) if p.is_dir()]
@@ -81,12 +103,12 @@ def compute_embeddings_for_paths(paths, processor, model, device, batch_size):
             # Use mixed precision for CUDA operations
             if device == "cuda":
                 with torch.amp.autocast('cuda'):
-                    inputs = processor(images=imgs, return_tensors="pt")
+                    inputs = processor(images=imgs, return_tensors="pt", **DINO_PREPROC)
                     inputs = {k: v.to(device) for k, v in inputs.items()}
                     outputs = model(**inputs)
                     emb_batch = outputs.last_hidden_state.mean(dim=1)
             else:
-                inputs = processor(images=imgs, return_tensors="pt")
+                inputs = processor(images=imgs, return_tensors="pt", **DINO_PREPROC)
                 inputs = {k: v.to(device) for k, v in inputs.items()}
                 outputs = model(**inputs)
                 emb_batch = outputs.last_hidden_state.mean(dim=1)
@@ -166,9 +188,10 @@ def main():
 
         # Check if embeddings already exist and use_cache is enabled
         if args.use_cache and emb_out_path.exists() and mapping_path.exists():
-            print(f"✅ Using cached embeddings from: {emb_out_path.name}")
-            print(f"   (Use --use_cache to skip regeneration on re-runs)")
-            continue
+            if cached_tag(emb_out_path) == PREPROC_TAG:
+                print(f"✅ Using cached embeddings from: {emb_out_path.name}")
+                continue
+            print(f"⚠️  Cached {emb_out_path.name} was made with different/unknown preprocessing — regenerating")
         elif emb_out_path.exists():
             print(f"⚠️  Note: {emb_out_path.name} already exists. Overwriting previous embeddings!")
 
@@ -182,6 +205,7 @@ def main():
 
         # Save embeddings as N x 768 numpy file
         np.save(str(emb_out_path), embeddings)
+        meta_path_for(emb_out_path).write_text(json.dumps({"preproc": PREPROC_TAG}), encoding="utf-8")
         print(f"  Saved embeddings to: {emb_out_path}")
         
         # Save mapping of valid image filenames to preserve alignment

@@ -52,7 +52,18 @@ CLASSES_PER_OVERVIEW_PAGE = 30
 MAX_OUTLIERS_PER_CLASS = 30
 
 
-def auto_tune_eps(embeddings, min_samples, percentile):
+def knee_index(sorted_vals):
+    """Elbow of an ascending curve: point farthest below the chord from first to last value
+    (Kneedle-style, on [0,1]-normalised axes). None if the curve is flat."""
+    y = np.asarray(sorted_vals, dtype=float)
+    if len(y) < 3 or y[-1] - y[0] <= 0:
+        return None
+    x = np.linspace(0.0, 1.0, len(y))
+    y_norm = (y - y[0]) / (y[-1] - y[0])
+    return int(np.argmax(x - y_norm))
+
+
+def auto_tune_eps(embeddings, min_samples, percentile, method="knee"):
     """
         Automatically find optimal eps using k-nearest neighbors.
         What this does?
@@ -67,6 +78,16 @@ def auto_tune_eps(embeddings, min_samples, percentile):
         Point 2: [0.03, 0.10, 0.14]
         ...
         Point 199: [0.06, 0.13, 0.19]
+        ```
+
+        kneighbors() on the fit data counts each point as its own 1st neighbour, so the last column
+        is exactly DBSCAN's core-point test (min_samples incl. the point itself): a point is core
+        iff its k-distance <= eps.
+        - method="percentile": eps = p-th percentile → ~p% of points are core BY CONSTRUCTION, so the
+          outlier rate is capped near (100-p)% and reflects the setting, not the data.
+        - method="knee" (default): eps = elbow of the sorted k-distance curve (classic DBSCAN
+          heuristic, Ester et al. 1996) → the outlier rate is driven by the data. Falls back to
+          percentile if the curve is flat.
     """
 
     # Converts each 768D embedding vector to unit length to make cosine distance calculations work properly
@@ -87,8 +108,14 @@ def auto_tune_eps(embeddings, min_samples, percentile):
     # Use the distance to the k-th nearest neighbor --- distance to the **farthest** of the k-nearest neighbors
     k_distances = np.sort(np.asarray(distances[:, -1]))
 
-    # Choose eps at a percentile (avoids extreme outliers skewing the value) -- This means: "90% of points have their k-th neighbor within this distance" so as less as possible outliers
-    pct = np.percentile(k_distances, percentile)
+    knee = knee_index(k_distances) if method == "knee" else None
+    if knee is not None:
+        pct = k_distances[knee]
+        print(f"  [eps] knee at {knee / max(len(k_distances) - 1, 1) * 100:.1f}th percentile of k-distances")
+    else:
+        if method == "knee":
+            print("  [eps] flat k-distance curve — falling back to percentile")
+        pct = np.percentile(k_distances, percentile)
 
     # Convert euclidean percentile back to cosine-domain so eps stays in cosine units throughout
     if GPU_BACKEND:
@@ -418,6 +445,9 @@ def main():
     parser.add_argument("--uniform_eps_threshold", type=float, default=0.10, help="If auto-tuned eps < this, consider class uniform")
     parser.add_argument("--uniform_downsample_target", type=int, default=5000, help="Target samples for uniform classes")
     parser.add_argument("--uniform_min_samples", type=int, default=10000, help="Only downsample if class has more than this")
+    parser.add_argument("--eps_method", choices=["knee", "percentile"], default="knee",
+                        help="Auto-tune rule: knee of k-distance curve (data-driven outlier rate) or "
+                             "--auto_tune_percentile (outlier rate capped near 100-p%%)")
     parser.add_argument("--pca_components", type=int, default=128, help="PCA dims before clustering (0=disabled). Reduces 768d→Nd to fix curse of dimensionality at large N.")
     args = parser.parse_args()
 
@@ -491,8 +521,9 @@ def main():
 
         # Auto-tune eps if requested
         if args.auto_tune:
-            optimal_eps = auto_tune_eps(embeddings_for_clustering, args.min_samples, percentile=args.auto_tune_percentile)
-            print(f"  Auto-tuned eps: {optimal_eps:.4f} (percentile={args.auto_tune_percentile})")
+            optimal_eps = auto_tune_eps(embeddings_for_clustering, args.min_samples,
+                                        percentile=args.auto_tune_percentile, method=args.eps_method)
+            print(f"  Auto-tuned eps: {optimal_eps:.4f} (method={args.eps_method})")
             eps_to_use = optimal_eps
         else:
             eps_to_use = args.eps
@@ -512,6 +543,13 @@ def main():
             n_samples_to_cluster = len(embeddings_to_cluster)
 
             print(f"  ✓ Using {n_samples_to_cluster} samples for clustering (stride={stride})")
+
+            # Subsample has 1/stride the density — re-tune eps on what DBSCAN will actually see,
+            # otherwise the full-set eps is too tight and inflates noise
+            if args.auto_tune:
+                eps_to_use = auto_tune_eps(embeddings_to_cluster, args.min_samples,
+                                           percentile=args.auto_tune_percentile, method=args.eps_method)
+                print(f"  Re-tuned eps on subsample: {eps_to_use:.4f}")
         else:
             embeddings_to_cluster = embeddings_for_clustering
             image_files_to_cluster = image_files

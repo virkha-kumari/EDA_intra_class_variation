@@ -121,7 +121,7 @@ def create_activity_montage(image_paths, activity_id, max_samples, grid_cols, ta
 def create_blurry_images_montage(blurry_image_cache, grid_cols, target_height):
     """
     Create a montage of blurry image samples using pre-cached images.
-    Blurry = low sharpness (focus blur) OR high anisotropy (motion blur).
+    Blurry = high gradient anisotropy (directional blur: motion blur / camera shake). Defocus is not detected.
     """
     if len(blurry_image_cache) == 0:
         return None
@@ -154,7 +154,7 @@ def create_blurry_images_montage(blurry_image_cache, grid_cols, target_height):
     # Create montage canvas
     montage = PILImage.new('RGB', (montage_width, montage_height), color='white')
 
-    # Paste images with sharpness, anisotropy, and brightness values
+    # Paste images with anisotropy and brightness values
     draw = ImageDraw.Draw(montage)
 
     try:
@@ -383,7 +383,7 @@ def _add_quality_dashboard(story, analysis_data, temp_dir, heading_style, subhea
     story.append(Spacer(1, 0.1*inch))
 
     story.append(Paragraph(
-        "This section shows the distribution of brightness and sharpness across all frames. "
+        "This section shows the distribution of brightness and directional (motion) blur across all frames. Blur is measured by gradient anisotropy, which flags motion blur / camera shake but not defocus. "
         "Use these metrics to identify frames that should be dropped before annotation.",
         normal_style
     ))
@@ -418,7 +418,7 @@ def _add_quality_dashboard(story, analysis_data, temp_dir, heading_style, subhea
                                         fontSize=11, fontName='Helvetica-Bold',
                                         textColor=colors.HexColor('#388e3c'))
         story.append(Spacer(1, 0.2*inch))
-        story.append(Paragraph("✅ No blurry frames detected - all frames have acceptable sharpness!", no_blurry_style))
+        story.append(Paragraph("✅ No motion-blurred frames detected (anisotropy below threshold for all frames).", no_blurry_style))
 
     story.append(PageBreak())
 
@@ -436,8 +436,8 @@ def _add_blurry_samples(story, analysis_data, temp_dir, heading_style, subheadin
 
         blurry_montage_path = compress_image_for_pdf(blurry_montage_path_png, quality=image_quality)
         story.append(Paragraph(
-            f"Below are up to {min(20, blurry_count)} sample blurry frames that should be reviewed for removal. "
-            f"These frames have motion blur, out-of-focus issues, or camera shake. "
+            f"Below are sample motion-blurred frames ({blurry_count} flagged in total) that should be reviewed for removal. "
+            f"These frames show directional blur (motion blur or camera shake); out-of-focus frames are not detected by this metric. "
             f"Anisotropy (motion blur metric) and brightness values are shown below each image.",
             normal_style
         ))

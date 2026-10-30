@@ -1,4 +1,9 @@
 """
+⚠️  DEPRECATED — NOT MAINTAINED. Kept for reference only. This post-training workflow (and
+postannotation_scripts/1. yolo_model_crop_bbox_per_class.py) is no longer used, updated, or
+tested; it predates the current fixes and has known issues (crops overwriting each other,
+sample count not met). Do not use its output for analysis.
+
 Master script to run entire intra and inter class variation EDA pipeline.
 Includes memory management and cooling breaks for laptop GPUs.
 
@@ -13,6 +18,9 @@ import time
 import psutil
 import os
 import torch
+
+print("⚠️  DEPRECATED: master_script_dinov2_PostTrain.py is not maintained — reference only, see docstring.")
+
 
 def clear_memory():
     """Aggressive memory cleanup."""

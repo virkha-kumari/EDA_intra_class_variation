@@ -12,30 +12,20 @@ So: given an annotated dataset, find the frames where a human annotator probably
 
 ## Attempt 1 — throw a detector at it (`Auto_Annotation_YOLO_formatted`)
 
-The obvious framing: missed-label detection is auto-annotation. If I can auto-annotate the dataset and diff those predictions against the human labels, whatever the model finds that the human didn't is a missed-label candidate. I already had a whole repo for this — [Auto_Annotation_YOLO_formatted](https://github.com/virkha-kumari/Auto_Annotation_YOLO_formatted) — built over ~3 months for exactly the adjacent problem: label 10–15 instances per class, auto-annotate thousands of frames.
+The obvious framing: missed-label detection is auto-annotation. If I can auto-annotate the dataset and diff those predictions against the human labels, whatever the model finds that the human didn't is a missed-label candidate. I already had a whole repo for this — [Auto_Annotation_YOLO_formatted](https://github.com/virkha-kumari/Auto_Annotation_YOLO_formatted) — built for exactly the adjacent problem: label *k* instances per class, auto-annotate thousands of frames.
 
 That repo went through a long chain of proposal generators, and every one of them is documented there with the reason it failed:
 
 - **SAM2 auto mask generation** — thousands of masks per image, zero useful ones on industrial scenes. Auto-mask works on natural images with strong texture-contrast at object boundaries. Large uniform-colour industrial objects give it nothing to latch onto.
 - **SAM3 auto mask generation** — same architectural premise, same failure. Dropped.
-- **OWLv2 image-guided detection** — tested at 640px, 1008px, 1280px, per-crop and batched. On a large uniform object covering ~60% of the frame, *every single proposal* was a tiny box at the image edge. Root cause is architectural: OWLv2 is a patch-based ViT that matches 16×16 tile-level texture and cannot compose a box spanning many tiles. Not a tuning problem.
+- **OWLv2 image-guided detection** — tested at 640px, 1008px, 1280px, per-crop and batched. On a large uniform object covering ~60% of the frame, *every single proposal* was a tiny box at the image edge. No resolution or pipeline configuration produced a proposal spanning the large object.
 - **YOLOe visual-prompt detection** — finally worked as a proposal generator. Multi-scale feature pyramid, genuine native few-shot via `get_vpe(refer_image)`. Confirmed well-localized proposals at conf ≥ 0.06.
 
-So Pipeline A became YOLOe → SAM2 (masking) → DINOv2 (similarity scoring) → WBF → containment filter. Pipeline B later replaced the front half with SAM3 canvas-composite few-shot prompting (SAM3 has no cross-image exemplar API, so reference and target get pasted into one shared canvas — the [FSS-SAM3](https://github.com/WongKinYiu/FSS-SAM3) trick). Both pipelines work end-to-end. Neither is good enough.
+So Pipeline A became YOLOe → SAM2 (masking) → DINOv2 (similarity scoring) → WBF → containment filter. Pipeline B later replaced the front half with SAM3 canvas-composite few-shot prompting (SAM3 has no cross-image exemplar API, so reference and target get pasted into one shared canvas — the [FSS-SAM3](https://github.com/WongKinYiu/FSS-SAM3) trick). Both pipelines work end-to-end, but neither is good enough to audit with. (That repo's k-shot evaluation is in progress; its README holds the numbers.)
 
-**The numbers, on Construction-PPE:**
+Preliminary runs showed the pattern that matters here. Large, distinctive classes (person, vest) came out usable. Small, visually ambiguous ones (gloves vs bare hands, goggles vs glasses, boots vs shoes) produced few true positives and many false positives. Those are exactly the classes most likely to be missed by a human annotator. For them, **correcting the auto-annotations costs more than labelling from scratch**: misses can be skipped, but false positives have to be actively deleted.
 
-| | Pipeline A (50 img, 7 classes w/ GT) | Pipeline B (150 img, 11 classes) |
-|---|---|---|
-| mAP@.50 | 0.254 | 0.147 |
-| Best class | Person, F1=0.690 | Person, F1=0.725 |
-| Worst | goggles, prec=0.023 (43 preds, ~1 TP) | no_boots, prec=0.004 (540 preds, 53 GT) |
-
-Person and vest are usable. Helmet at F1=0.46 is marginal. Gloves at F1=0.11, boots at 0.21, goggles at prec=0.023 are not — for those, **correcting the auto-annotations costs more than labelling from scratch**, and goggles is actively harmful (43 false positives to buy one true positive; misses can be skipped, FPs have to be actively deleted).
-
-The failure isn't a threshold that needs tuning. Standard YOLO trained on the same dataset gets mAP@.50 > 0.85. YOLOe visual-prompt mode gets 0.254 on the same backbone. The gap is entirely in the classification head — a trained YOLO has learned per-class decision boundaries from thousands of examples; YOLOe's VPE is a single mean-pooled reference vector compared by cosine distance. For visually ambiguous classes (gloves vs bare hands, goggles vs glasses, boots vs shoes) that's a hard architectural ceiling.
-
-And the cost: ~20 minutes for 50 targets × 10 classes on an RTX 4060 8GB, three models loaded and unloaded sequentially, YOLOe's Phase 1 scaling as `O(stems × ceil(targets/batch))`. Not practical past ~200–300 targets.
+It was also expensive: three large models loaded and unloaded in sequence per run on an 8 GB GPU, with the proposal stage scaling with reference frames × target images.
 
 ## The realisation — I was solving a much harder problem than I needed to
 
@@ -63,22 +53,20 @@ This is deliberately imitating **active learning**: the pipeline's job is not to
 
 **3. Greedy-dedup them into `seen_<cls>_regions`.** Walk the boxes; keep one only if its IoU with every already-kept region is below 0.8. What survives is the small set of distinct places this class has ever occupied. On a fixed camera, thousands of GT boxes typically collapse to a handful of regions.
 
-**4. Pad each region by 2% of image width/height** per side. Not box-relative padding (which is what the auto-annotation repo's crop extractor uses) — image-relative, so every region gets the same absolute slack regardless of its size. A tight GT box that clipped a fingertip or an edge shouldn't produce a candidate crop that clips it too.
+**4. Crop every region out of every image in the dataset.** All of them, labelled or not: a missed instance can sit in a frame where other classes are labelled correctly. Candidates are cut with **exactly Script 1's crop rule** (same pixel conversion, no padding, same JPEG quality) as the reference crops they are compared against. An earlier version padded candidates by 2% of the image, which made small-object candidates several times larger than their references and lowered their similarity systematically.
 
-**5. Crop every region out of every image in the dataset.** All of them, labelled or not — a missed instance can perfectly well sit in a frame that has other classes correctly labelled.
+**5. Suppress candidates that overlap existing ground truth.** If a same-class GT box in that image has IoU ≥ 0.8 with the region, or covers ≥ 50% of the smaller of the two boxes, that instance is already labelled and the region is dropped. The containment test matters: kept regions may overlap each other (IoU just under 0.8), so with IoU alone a labelled object could reappear through a neighbouring region and be flagged as "missed".
 
-**6. Suppress candidates that overlap existing ground truth.** If a candidate region has IoU ≥ 0.8 with a GT box *of the same class in that same image*, that instance is already labelled. Drop it. This is what keeps the output list to genuine misses instead of re-reporting the entire dataset back at you.
-
-**7. Build the reference pool from the class's own embeddings.** This is where USB gets to reuse the EDA pipeline it lives inside. Script 2 has already embedded every GT crop of this class with DINOv2 (768d, mean-pooled). Re-running DBSCAN on those cached embeddings (cheap — pure array math, no GPU, no image I/O) gives cluster structure, and from it:
+**6. Build the reference pool from the class's own embeddings.** This is where USB reuses the EDA pipeline it lives inside. Script 2 has already embedded every GT crop of this class with DINOv2 (768d, mean-pooled). Re-running DBSCAN on those cached embeddings (eps from the knee of the k-distance curve; cheap array math, no GPU, no image I/O) gives the cluster structure, and from it:
    - **every noise point** (DBSCAN label −1) — these are the genuinely unusual-looking instances, and a missed instance is disproportionately likely to be unusual-looking
    - **per cluster: the centroid** — the canonical appearance
    - **per cluster: the N points farthest from that centroid** by cosine distance (default 4, tunable) — the edges of each cluster
 
    Just using centroids would be the averaged-prototype mistake the auto-annotation repo already made and documented: averaging diverse crops "washes out the discriminative signal — the average lives in a region of embedding space that no individual crop actually occupies." Centroid + farthest points + noise covers typical *and* edge appearance without collapsing them together.
 
-**8. Embed the candidate crops and score them.** Same DINOv2 function Script 2 uses — literally imported from it, not reimplemented, because the reference embeddings and the candidate embeddings must live in the same subspace or the cosine similarities are meaningless. (The auto-annotation repo learned this one the hard way too: *"refs and proposals for each class must use the same embedding method."*) Score each candidate as max cosine similarity against the reference pool — per-crop max, not against an average.
+**7. Embed the candidate crops and score them.** Same DINOv2 function and preprocessing as Script 2 (imported from it, not reimplemented, and checked against the preprocessing tag stored next to the cached embeddings), because reference and candidate embeddings must live in the same space or the cosine similarities are meaningless. (The auto-annotation repo learned this one the hard way too: *"refs and proposals for each class must use the same embedding method."*) Score each candidate as max cosine similarity against the reference pool — per-crop max, not against an average.
 
-**9. Flag anything above the per-class threshold** (default 0.8, tunable per class because visually tight classes and visually variable classes need different cutoffs). Output is the full frame with the flagged region drawn in red with its similarity score, plus existing GT boxes of that class in green for context, written to `missing_labels/<class>/<image>.jpg`.
+**8. Flag anything above the per-class threshold** (default 0.8, tunable per class because visually tight classes and visually variable classes need different cutoffs). Output is the full frame with the flagged region drawn in red with its similarity score, plus existing GT boxes of that class in green for context, written to `missing_labels/<class>/<image>.jpg`.
 
 ### What this buys
 
@@ -112,6 +100,8 @@ It's a "jugaad". It works because it refuses to solve the hard problem.
 USB ships as `postannotation_scripts/5. usb_missed_labels.py`, wired into `master_scripts/master_script_dinov2_PostAnn_PreTrain.py` as an optional Step 5 — after the PDF report, before the intermediate crops get deleted (it needs those cached `.npy` embeddings). There's also a USB-only mode that skips clustering and PDF generation entirely and runs just crops → embeddings → USB for the selected classes.
 
 ## What's next
+
+**Evaluation (not yet done).** The cleanest test needs no new labelling: remove a known random fraction of GT boxes of a class (label dropout), run USB on the reduced labels, and measure the precision and recall of the flagged frames against the removed boxes. The same sweep calibrates the per-class threshold.
 
 The main open question is threshold behaviour across class types. 0.8 is a starting default, not a validated number — visually tight classes and visually variable ones will almost certainly want different cutoffs, and the right way to find them is to look at the score distribution of flagged-vs-suppressed candidates per class rather than guessing. Worth measuring: precision of the flagged set against a hand-audited sample, since the only metric that matters here is what fraction of flagged frames actually contain something a human wants to draw.
 

@@ -1,46 +1,69 @@
 # Finding the Right Embedding for Dataset Quality Checks
 
-*An embedding ablation from the EDA intra-class variation pipeline focusing on raw frames where environment is cluttered, multiple objects present, and no direction of where to actually focus.*
+*An embedding ablation from the pre-annotation pipeline: raw frames where the scene is cluttered, several objects are present, and nothing tells the model where to focus.*
 
 ## The problem
 
-Before training a detection model on industrial assembly-line video, I needed a way to answer a simple question: **are these frames actually worth annotating?** A folder of raw video frames can look fine at a glance and still be a bad training set — redundant near-duplicates, all shot from one angle, missing lighting conditions, or just not diverse enough to teach a model anything generalizable.
+Before training a detector on industrial fixed-camera video, I needed to answer a simple question: **are these frames worth annotating?** A folder of frames can look fine and still be a poor training set: near-duplicates, one viewpoint, missing lighting conditions, or too few distinct scenarios.
 
-The plan was to embed each frame with a frozen vision encoder, cluster the embeddings, and read the cluster structure as a proxy for dataset diversity: few, tight clusters mean low diversity; many well-separated clusters mean the dataset actually covers different scenarios. The open question was which encoder and which pooling strategy would give clusters that reflected *real* scene differences rather than incidental noise.
+The plan: embed each frame with a frozen vision encoder, cluster the embeddings, and read the cluster structure as a proxy for diversity. The open question was which encoder and which pooling give clusters that track *real* scenario differences rather than incidental noise.
 
-## Attempt 1 — DINOv2, mean-pooled
+## Attempt 1 — DINOv2, mean of all tokens
 
-The first thing I tried was the same pooling strategy I already used successfully for cropped object embeddings (post-annotation/pre-training) in the pipeline: average all 257 DINOv2 tokens (1 CLS + 256 patches) into a single 768-dimensional vector.
+The first try reused the pooling that already worked for object crops: average all 257 DINOv2 tokens (1 CLS + 256 patches) into one 768d vector.
 
-This works well on a tight crop, because a crop *is* the object — there's not much else in the frame to average away. On a full scene frame, it failed for the opposite reason: averaging over the whole image erases exactly the spatial variation that distinguishes one activity from another. A frame of someone fastening a bolt and a frame of someone scanning a barcode ended up looking similar once everything got flattened into one mean vector. The clusters that formed didn't track activity at all.
+On a tight crop this is fine, because the crop *is* the object. On a full frame the clusters did not follow the scenarios. Note what this vector actually is: with 256 patch tokens and 1 CLS token, the mean of all 257 is almost exactly the mean of the patch tokens. The global CLS summary contributes about 1/257 of it.
 
-## Attempt 2 — SigLIP, pooled output
+## Attempt 2 — SigLIP pooled output
 
-Next I tried SigLIP's pooled output, reasoning that a model trained with image-text contrastive objectives might have stronger scene-level semantics baked into its global representation.
+SigLIP's pooled output, from an image-text contrastive model, looked better separated by eye. But clusters were less pure: frames that clearly belonged elsewhere showed up inside clusters, apparently because grouping followed broad scene semantics more than the finer differences between similar assembly scenarios.
 
-This was a real improvement. The clusters were measurably better separated — SigLIP's scene-level understanding pulled apart genuinely different activities more cleanly than DINOv2's averaged tokens had. But a new problem showed up: **cluster purity**. Frames that obviously didn't belong kept showing up inside clusters they had no business being in. SigLIP seemed to be grouping by broad semantic category — "this looks like an indoor scene," "this looks outdoors" — without being sensitive enough to the texture and spatial layout differences that actually separate one assembly activity from a visually similar one.
+## Attempt 3 — DINOv2, `[CLS ‖ mean(patch tokens)]`
 
-Better separation, worse purity. Not a clean win.
+Same encoder, different pooling: concatenate the **CLS token** (DINOv2's global summary of the frame) with the **mean of the patch tokens**, kept as separate halves of a 1536d vector.
 
-## Attempt 3 — DINOv2, with a different pooling strategy
+What the patch half adds is **local, patch-level content**. DINOv2's patch tokens are trained to be informative on their own, so their average summarises *what is present across the frame's patches*: the objects, parts and textures. Averaging discards *where* they are; this is a bag of local features, not a spatial layout. The CLS half adds the global view that attempt 1 had diluted to 1/257 of the vector. Concatenating rather than averaging keeps both signals at full weight, so the clustering sees the global summary and the local content separately.
 
-The fix turned out to be a different way of using the *same* encoder I'd already ruled out, not a different encoder. Instead of mean-pooling all 257 tokens, I concatenated just two things:
+In my runs this gave visibly cleaner clusters than both the CLS-only and the SigLIP variants, with fewer misplaced frames in the montages.
 
-- the **CLS token** — DINOv2's summary of the whole scene
-- the **mean of all patch tokens** — averaged separately, not folded into the CLS
+## Numbers
 
-This gives a 1536-dimensional vector where the first half answers "what is this scene overall" and the second half answers "what's actually here, spatially." Keeping them concatenated rather than further averaged turned out to matter: DINOv2's patch tokens are trained to be useful on their own (not just as supporting context for a global label), so the spatial detail they carry doesn't survive a second round of averaging.
+Measured with [utils/test_embed_models.py](../utils/test_embed_models.py) on 4,175 industrial frames, using the pipeline's preprocessing (whole frame, no center crop).
 
-The result: tighter clusters *and* better purity than the SigLIP run. Quantitatively, this `[CLS||avg_patches]` approach beat SigLIP's pooled output by **+0.253 in silhouette score** — a substantial improvement in how cleanly the embedding space separates within-class from cross-class structure. The purity gain is harder to put a single number on, but it's visible directly in the cluster montages: far fewer frames sitting in the wrong group.
+**Same vs different activity.** 12 frames of one activity, 11 of different activities. Pair AUC is the probability that a same-activity pair is more similar than a different-activity pair; it is scale-free, so it compares across models.
 
-## Why this matters beyond one pipeline
+| Variant | Same-activity cos | Different-activity cos | Gap | Pair AUC |
+|---|---|---|---|---|
+| DINOv2 mean (768d) | 0.946 | 0.620 | +0.326 | 0.964 |
+| DINOv2 CLS (768d) | 0.910 | 0.449 | +0.461 | 0.941 |
+| **DINOv2 CLS ‖ patch-mean (1536d)** | 0.919 | 0.489 | +0.430 | 0.948 |
+| SigLIP pooled (768d) | 0.953 | 0.787 | +0.165 | 0.917 |
 
-The takeaway isn't "DINOv2 is better than SigLIP" — attempt 1 used DINOv2 and lost to SigLIP. The takeaway is that **pooling strategy and input scale need to match**. A tight object crop and a full scene frame aren't the same kind of input, and forcing them through the same pooling logic throws away exactly the signal you need. This pipeline now deliberately uses two different strategies depending on where it sits in the pipeline:
+**Full set, clustered by the pipeline's own function.**
 
-- **Full scene frames** (pre-annotation, diversity checks): `[CLS||avg_patches]`, 1536d — separating global identity from spatial detail gives clustering more structure to work with on noisy, varied scenes.
-- **Object crops** (pre/post-training, intra-class variation): mean-pooled, 768d — the crop *is* the object, so the extra dimensions from keeping CLS and patches separate just add noise without a clear gain.
+| Variant | Clusters | Noise (unclustered) | Silhouette (own clusters) |
+|---|---|---|---|
+| DINOv2 mean | 44 | 43.2% | 0.107 |
+| DINOv2 CLS | 50 | 44.4% | 0.119 |
+| **DINOv2 CLS ‖ patch-mean** | 45 | **39.4%** | 0.096 |
+| SigLIP pooled | 38 | 51.7% | 0.124 |
 
-This kind of "it depends on what you're embedding" answer doesn't show up if you only ever benchmark one encoder on one task. It only shows up by trying the wrong thing, understanding *why* it was wrong, and testing whether the fix generalizes.
+What the numbers say:
+
+- **SigLIP's purity problem is real and measurable.** It rates *different* activities at cosine 0.787, barely below same-activity pairs (0.953), so its same/different gap is 2–3× smaller than any DINOv2 variant's. That is the "frames that don't belong inside clusters" effect seen in the montages. It also leaves the most frames unclustered (51.7%).
+- **CLS ‖ patch-mean keeps different activities far apart.** Different-activity cosine is 0.489 vs 0.620 for mean pooling, a margin of +0.430 vs +0.326 (about 32% larger; CLS-only +0.461). Mean pooling ranks pairs marginally better (AUC 0.964) only because it pulls every frame close together; AUC checks order, not distance.
+- **CLS ‖ patch-mean clusters the most data:** 39.4% noise, about 510 more frames grouped than SigLIP and 150–200 more than the other DINOv2 poolings, at comparable cluster quality. Its activity separation beats CLS-only (0.948 vs 0.941).
+- **Among DINOv2 poolings, separation is statistically tied on this small subset.** Mean pooling scores 0.964, but with 23 frames the differences are within noise. A larger labelled activity set would settle the ranking.
+- Silhouette on each variant's *own* clustering is not a fair head-to-head. SigLIP's 0.124 is computed only on the 48% of frames it managed to cluster.
+
+An earlier write-up quoted "+0.253 silhouette vs SigLIP". That number is withdrawn: it could not be reproduced from this repo's code, and silhouettes from different embedding spaces and clusterings are not directly comparable. The measurements above replace it.
+
+## Takeaway
+
+The lesson is not "DINOv2 beats SigLIP": attempt 1 used DINOv2 and lost. It is that **pooling has to match the input scale**. A crop and a full scene are different inputs:
+
+- **Full frames** (pre-annotation): `[CLS ‖ patch-mean]`, 1536d. The global summary and the local content are kept separate.
+- **Object crops** (post-annotation): mean of all tokens, 768d. The crop is the object, so the local content *is* the signal.
 
 ## What's next
 

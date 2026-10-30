@@ -53,3 +53,8 @@ ENV/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+temp_multiview_emb*.json
+
+# benchmark outputs (store local dataset paths)
+bench_*.json
+benchmark_*.json
